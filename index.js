@@ -253,6 +253,53 @@ app.post("/webhooks/calendly", async (req, res) => {
   return res.status(200).json({ ok: true });
 });
 
+// ===== WhatsApp Cloud API (test sender) =====
+const {
+  WHATSAPP_ACCESS_TOKEN,
+  WHATSAPP_PHONE_NUMBER_ID,
+  META_GRAPH_VERSION = "v22.0",
+} = process.env;
+
+app.post("/whatsapp/send-test", async (req, res) => {
+  try {
+    const { to, text } = req.body;
+
+    if (!WHATSAPP_ACCESS_TOKEN || !WHATSAPP_PHONE_NUMBER_ID) {
+      return res.status(500).json({ ok: false, error: "Missing WhatsApp env vars" });
+    }
+
+    if (!to || !text) {
+      return res.status(400).json({ ok: false, error: "Body must include { to, text }" });
+    }
+
+    // WhatsApp expects E.164 without spaces, e.g. +34600111222
+    const toClean = String(to).replace(/\s/g, "");
+
+    const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
+
+    const payload = {
+      messaging_product: "whatsapp",
+      to: toClean,
+      type: "text",
+      text: { body: text },
+    };
+
+    const resp = await axios.post(url, payload, {
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+    return res.status(200).json({ ok: true, data: resp.data });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err?.response?.data || err.message,
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log("Server running on port", PORT, "TZ=", TZ, "NODE_ENV=", NODE_ENV);
 });
