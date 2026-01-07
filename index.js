@@ -263,6 +263,7 @@ const {
 app.post("/whatsapp/send-test", async (req, res) => {
   try {
     const { to, text } = req.body;
+    console.log("[WA-SEND] Using WHATSAPP_PHONE_NUMBER_ID =", WHATSAPP_PHONE_NUMBER_ID);
 
     if (!WHATSAPP_ACCESS_TOKEN || !WHATSAPP_PHONE_NUMBER_ID) {
       return res.status(500).json({ ok: false, error: "Missing WhatsApp env vars" });
