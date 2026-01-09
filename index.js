@@ -3,8 +3,11 @@ const express = require("express");
 const axios = require("axios");
 
 const app = express();
+
+// ✅ Parsear JSON una sola vez (suficiente para todos los POST)
 app.use(express.json({ limit: "1mb" }));
 
+// ✅ Render necesita usar process.env.PORT
 const PORT = process.env.PORT || 3000;
 
 // ===== ENV =====
@@ -25,7 +28,9 @@ const {
 } = process.env;
 
 // ===== Basic routes =====
-app.get("/", (req, res) => res.status(200).send("Calendly → Airtable sync service running"));
+app.get("/", (req, res) =>
+  res.status(200).send("Calendly → Airtable sync service running")
+);
 app.get("/health", (req, res) => res.status(200).send("OK"));
 
 // ===== Helpers =====
@@ -42,7 +47,7 @@ function toE164Spain(phoneRaw) {
 
 function getAnswer(questionsAndAnswers, containsText) {
   if (!Array.isArray(questionsAndAnswers)) return null;
-  const item = questionsAndAnswers.find(q =>
+  const item = questionsAndAnswers.find((q) =>
     (q.question || "").toLowerCase().includes(containsText.toLowerCase())
   );
   return item ? item.answer : null;
@@ -82,7 +87,7 @@ function normalizeChannel(raw) {
 
 // ===== Airtable API =====
 const airtableBaseUrl = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
-  AIRTABLE_TABLE_NAME
+  AIRTABLE_TABLE_NAME || ""
 )}`;
 
 async function airtableFindByCalendlyId(calendlyId) {
@@ -153,13 +158,6 @@ async function fetchScheduledEvents() {
 }
 
 async function fetchInviteesForEvent(eventUri) {
-  // eventUri es tipo: https://api.calendly.com/scheduled_events/XXXX
-  // Aquí hay dos formas:
-  // 1) pasar el ID (la última parte)
-  // 2) usar el endpoint completo encodeando la URI
-  // Calendly soporta: /scheduled_events/{uuid}/invitees
-  // Pero eventUri suele ser URI completa, así que extraemos el "uuid":
-
   const parts = eventUri.split("/");
   const uuid = parts[parts.length - 1];
 
@@ -170,7 +168,13 @@ async function fetchInviteesForEvent(eventUri) {
 // ===== Sync Logic =====
 async function syncCalendlyToAirtable() {
   try {
-    if (!CALENDLY_PAT || !CALENDLY_USER_URI || !AIRTABLE_TOKEN || !AIRTABLE_BASE_ID || !AIRTABLE_TABLE_NAME) {
+    if (
+      !CALENDLY_PAT ||
+      !CALENDLY_USER_URI ||
+      !AIRTABLE_TOKEN ||
+      !AIRTABLE_BASE_ID ||
+      !AIRTABLE_TABLE_NAME
+    ) {
       console.log("[SYNC] Missing env vars. Skipping.");
       return;
     }
@@ -181,10 +185,9 @@ async function syncCalendlyToAirtable() {
     console.log(`[SYNC] Found ${events.length} events`);
 
     for (const ev of events) {
-      const eventUri = ev.uri;           // URI completa
-      const calendlyId = ev.uri;         // usamos la URI como ID estable (sirve perfecto)
-      const startTime = ev.start_time;   // ISO (UTC)
-      const endTime = ev.end_time;       // ISO (UTC)
+      const eventUri = ev.uri;
+      const calendlyId = ev.uri;
+      const startTime = ev.start_time;
 
       const invitees = await fetchInviteesForEvent(eventUri);
       const invitee = invitees[0];
@@ -201,25 +204,21 @@ async function syncCalendlyToAirtable() {
 
       const phoneE164 = toE164Spain(phoneRaw);
 
-      // La pregunta del canal puede variar según el texto exacto
       const channelRaw =
-      getAnswer(questions, "canal") ||
-      getAnswer(questions, "contact") ||
-      getAnswer(questions, "¿cómo prefieres") ||
-      "WhatsApp";
-    
-    const channel = normalizeChannel(channelRaw);
+        getAnswer(questions, "canal") ||
+        getAnswer(questions, "contact") ||
+        getAnswer(questions, "¿cómo prefieres") ||
+        "WhatsApp";
 
+      const channel = normalizeChannel(channelRaw);
 
-
-      // Campos Airtable (ajusta si tus nombres son distintos)
       const fields = {
         [AIRTABLE_CALENDLY_ID_FIELD]: calendlyId,
-        "Nombre": name,
+        Nombre: name,
         "Teléfono E164": phoneE164,
-        "Fecha": startTime,
-        "Canal": channel,
-        "Status": "Programada",
+        Fecha: startTime,
+        Canal: channel,
+        Status: "Programada",
       };
 
       const existing = await airtableFindByCalendlyId(calendlyId);
@@ -242,10 +241,7 @@ async function syncCalendlyToAirtable() {
 // ===== Start polling =====
 const intervalMs = Number(CALENDLY_POLL_INTERVAL_MINUTES) * 60 * 1000;
 
-// Ejecuta una vez al arrancar
 syncCalendlyToAirtable();
-
-// Repite cada X minutos
 setInterval(syncCalendlyToAirtable, intervalMs);
 
 // Endpoint por si en el futuro tienes Webhooks en Calendly
@@ -257,7 +253,7 @@ app.post("/webhooks/calendly", async (req, res) => {
 const {
   WHATSAPP_ACCESS_TOKEN,
   WHATSAPP_PHONE_NUMBER_ID,
-  META_GRAPH_VERSION = "v22.0",
+  META_GRAPH_VERSION = "v24.0",
 } = process.env;
 
 app.post("/whatsapp/send-test", async (req, res) => {
@@ -273,7 +269,6 @@ app.post("/whatsapp/send-test", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Body must include { to, text }" });
     }
 
-    // WhatsApp expects E.164 without spaces, e.g. +34600111222
     const toClean = String(to).replace(/\s/g, "");
 
     const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
@@ -302,12 +297,9 @@ app.post("/whatsapp/send-test", async (req, res) => {
 });
 
 // ===== WhatsApp Webhook (verification + incoming messages) =====
-const { WHATSAPP_VERIFY_TOKEN } = process.env;
+const WHATSAPP_VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 
-// IMPORTANTE: Express debe parsear JSON ANTES de cualquier POST
-app.use(express.json());
-
-// 1) Verificación del webhook (Meta llama a este endpoint al conectar)
+// 1) Verificación del webhook
 app.get("/webhooks/whatsapp", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -322,14 +314,18 @@ app.get("/webhooks/whatsapp", (req, res) => {
   return res.sendStatus(403);
 });
 
-// 2) Recepción de eventos (mensajes entrantes, delivery, etc.)
+// 2) Recepción de eventos
 app.post("/webhooks/whatsapp", (req, res) => {
   res.sendStatus(200);
-
   try {
     console.log("[WA-WEBHOOK] POST ✅ content-type:", req.headers["content-type"]);
     console.log("[WA-WEBHOOK] BODY ✅", JSON.stringify(req.body).slice(0, 800));
   } catch (e) {
     console.error("[WA-WEBHOOK] Error parsing webhook:", e.message);
   }
+});
+
+// ✅ LISTEN AL FINAL (Render detecta el puerto)
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT, "TZ=", TZ, "NODE_ENV=", NODE_ENV);
 });
