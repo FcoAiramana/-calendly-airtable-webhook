@@ -5,6 +5,7 @@ const axios = require("axios");
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+// ✅ Render necesita process.env.PORT
 const PORT = process.env.PORT || 3000;
 
 // ===== ENV =====
@@ -15,13 +16,13 @@ const {
   CALENDLY_POLL_INTERVAL_MINUTES = "5",
   CALENDLY_LOOKAHEAD_DAYS = "14",
 
-  // Airtable
+  // Airtable (citas)
   AIRTABLE_TOKEN,
   AIRTABLE_BASE_ID,
   AIRTABLE_TABLE_NAME,
   AIRTABLE_CALENDLY_ID_FIELD = "ID Calendly",
 
-  // WhatsApp Conversations table (Airtable)
+  // Airtable (conversaciones)
   AIRTABLE_CONVERSATIONS_TABLE_NAME = "Conversaciones WhatsApp",
   AIRTABLE_WA_ID_FIELD = "wa_id",
   AIRTABLE_WA_LAST_MESSAGE_FIELD = "Último mensaje",
@@ -30,9 +31,14 @@ const {
   AIRTABLE_WA_STATUS_FIELD = "Estado conversación",
   AIRTABLE_WA_LINK_FIELD = "Cita (link)",
 
-  // WhatsApp Messages table (Airtable)
+  // Airtable (mensajes)
   AIRTABLE_MESSAGES_TABLE_NAME = "Mensajes WhatsApp",
-  AIRTABLE_MSG_CONVERSATION_FIELD = "Conversación",
+  AIRTABLE_MSG_ID_FIELD = "message_id",
+  AIRTABLE_MSG_DIRECTION_FIELD = "direction",
+  AIRTABLE_MSG_WA_ID_FIELD = "wa_id",
+  AIRTABLE_MSG_TEXT_FIELD = "Texto",
+  AIRTABLE_MSG_DATE_FIELD = "Fecha",
+  AIRTABLE_MSG_CONVO_LINK_FIELD = "Conversación",
 
   // WhatsApp Cloud API
   WHATSAPP_ACCESS_TOKEN,
@@ -40,7 +46,6 @@ const {
   WHATSAPP_VERIFY_TOKEN,
   META_GRAPH_VERSION = "v24.0",
 
-  // Misc
   TZ = "Europe/Madrid",
   LOG_LEVEL = "info",
   NODE_ENV = "development",
@@ -48,30 +53,13 @@ const {
 
 // ===== Basic routes =====
 app.get("/", (req, res) =>
-  res.status(200).send("Calendly → Airtable sync service running")
+  res.status(200).send("Calendly → Airtable sync + WhatsApp webhook service running")
 );
 app.get("/health", (req, res) => res.status(200).send("OK"));
 
-// ===== Helpers =====
-function toE164Spain(phoneRaw) {
-  if (!phoneRaw) return null;
-  let p = String(phoneRaw).trim();
-  p = p.replace(/[^\d+]/g, "");
-  if (p.startsWith("00")) p = "+" + p.slice(2);
-  if (p.startsWith("+")) return p;
-  if (/^\d{9}$/.test(p)) return "+34" + p;
-  if (/^34\d{9}$/.test(p)) return "+" + p;
-  return p;
-}
-
-function getAnswer(questionsAndAnswers, containsText) {
-  if (!Array.isArray(questionsAndAnswers)) return null;
-  const item = questionsAndAnswers.find((q) =>
-    (q.question || "").toLowerCase().includes(containsText.toLowerCase())
-  );
-  return item ? item.answer : null;
-}
-
+// =============================
+// Helpers
+// =============================
 function isoNow() {
   return new Date().toISOString();
 }
@@ -89,88 +77,48 @@ function logDebug(...args) {
   if (LOG_LEVEL === "debug") console.log(...args);
 }
 
-function normalizeChannel(raw) {
-  if (!raw) return "Whatsapp";
-  const t = raw.toLowerCase();
-
-  if (t.includes("whatsapp")) return "Whatsapp";
-  if (t.includes("por whatsapp")) return "Whatsapp";
-
-  if (t.includes("llamada")) return "Llamada Telefónica";
-  if (t.includes("teléfono") || t.includes("telefono")) return "Llamada Telefónica";
-
-  return "Whatsapp";
+// Convert wa_id "346187..." to E164 "+346187..."
+function toE164FromWaId(waId) {
+  if (!waId) return null;
+  return waId.startsWith("+") ? waId : `+${waId}`;
 }
 
-// ===== Airtable API: 1er Contacto =====
-const airtableAppointmentsUrl = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
+// =============================
+// Airtable API helpers
+// =============================
+function airtableHeaders() {
+  return {
+    Authorization: `Bearer ${AIRTABLE_TOKEN}`,
+    "Content-Type": "application/json",
+  };
+}
+
+const airtableCitasUrl = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
   AIRTABLE_TABLE_NAME || ""
 )}`;
 
-async function airtableFindByCalendlyId(calendlyId) {
-  const formula = encodeURIComponent(`{${AIRTABLE_CALENDLY_ID_FIELD}}="${calendlyId}"`);
-  const url = `${airtableAppointmentsUrl}?filterByFormula=${formula}`;
-
-  const res = await axios.get(url, {
-    headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` },
-  });
-
-  return res.data.records?.[0] || null;
-}
-
-async function airtableCreateAppointment(fields) {
-  const res = await axios.post(
-    airtableAppointmentsUrl,
-    { records: [{ fields }] },
-    {
-      headers: {
-        Authorization: `Bearer ${AIRTABLE_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-    }
-  );
-  return res.data.records?.[0];
-}
-
-async function airtableUpdateAppointment(recordId, fields) {
-  const res = await axios.patch(
-    airtableAppointmentsUrl,
-    { records: [{ id: recordId, fields }] },
-    {
-      headers: {
-        Authorization: `Bearer ${AIRTABLE_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-    }
-  );
-  return res.data.records?.[0];
-}
-
-// Buscar cita por teléfono E164 en "1er Contacto"
-async function airtableFindAppointmentByPhone(phoneE164) {
-  const formula = encodeURIComponent(`{Teléfono E164}="${phoneE164}"`);
-  const url = `${airtableAppointmentsUrl}?filterByFormula=${formula}`;
-
-  const res = await axios.get(url, {
-    headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` },
-  });
-
-  return res.data.records?.[0] || null;
-}
-
-// ===== Airtable: Conversations =====
 const airtableConversationsUrl = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
   AIRTABLE_CONVERSATIONS_TABLE_NAME
 )}`;
 
+const airtableMessagesUrl = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
+  AIRTABLE_MESSAGES_TABLE_NAME
+)}`;
+
+// ---- Citas: buscar por teléfono E164 ----
+async function airtableFindAppointmentByPhone(phoneE164) {
+  if (!phoneE164) return null;
+  const formula = encodeURIComponent(`{Teléfono E164}="${phoneE164}"`);
+  const url = `${airtableCitasUrl}?filterByFormula=${formula}`;
+  const res = await axios.get(url, { headers: airtableHeaders() });
+  return res.data.records?.[0] || null;
+}
+
+// ---- Conversaciones: buscar por wa_id ----
 async function airtableFindConversationByWaId(waId) {
   const formula = encodeURIComponent(`{${AIRTABLE_WA_ID_FIELD}}="${waId}"`);
   const url = `${airtableConversationsUrl}?filterByFormula=${formula}`;
-
-  const res = await axios.get(url, {
-    headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` },
-  });
-
+  const res = await axios.get(url, { headers: airtableHeaders() });
   return res.data.records?.[0] || null;
 }
 
@@ -178,12 +126,7 @@ async function airtableCreateConversation(fields) {
   const res = await axios.post(
     airtableConversationsUrl,
     { records: [{ fields }] },
-    {
-      headers: {
-        Authorization: `Bearer ${AIRTABLE_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-    }
+    { headers: airtableHeaders() }
   );
   return res.data.records?.[0];
 }
@@ -192,183 +135,158 @@ async function airtableUpdateConversation(recordId, fields) {
   const res = await axios.patch(
     airtableConversationsUrl,
     { records: [{ id: recordId, fields }] },
-    {
-      headers: {
-        Authorization: `Bearer ${AIRTABLE_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-    }
+    { headers: airtableHeaders() }
   );
   return res.data.records?.[0];
 }
 
-// ===== Airtable: Messages =====
-const airtableMessagesUrl = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
-  AIRTABLE_MESSAGES_TABLE_NAME
-)}`;
-
+// ---- Mensajes: crear siempre ----
 async function airtableCreateMessage(fields) {
   const res = await axios.post(
     airtableMessagesUrl,
     { records: [{ fields }] },
-    {
-      headers: {
-        Authorization: `Bearer ${AIRTABLE_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-    }
+    { headers: airtableHeaders() }
   );
   return res.data.records?.[0];
 }
 
-// ===== Calendly API =====
-const calendly = axios.create({
-  baseURL: "https://api.calendly.com",
-  headers: {
-    Authorization: `Bearer ${CALENDLY_PAT}`,
-    "Content-Type": "application/json",
-  },
+// =============================
+// SSE: Tiempo real (Portal)
+// =============================
+const sseClientsByWaId = new Map(); // wa_id -> Set(res)
+
+function sseSend(waId, event) {
+  const clients = sseClientsByWaId.get(waId);
+  if (!clients || clients.size === 0) return;
+
+  const payload = `data: ${JSON.stringify(event)}\n\n`;
+  for (const res of clients) {
+    try {
+      res.write(payload);
+    } catch (e) {}
+  }
+}
+
+// ✅ Portal se conecta aquí para recibir updates en tiempo real
+app.get("/sse", (req, res) => {
+  const waId = String(req.query.wa_id || "").trim();
+  if (!waId) return res.status(400).send("Missing wa_id");
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  // registrar cliente
+  if (!sseClientsByWaId.has(waId)) sseClientsByWaId.set(waId, new Set());
+  sseClientsByWaId.get(waId).add(res);
+
+  // mensaje inicial
+  res.write(`data: ${JSON.stringify({ type: "connected", waId, ts: isoNow() })}\n\n`);
+
+  // cleanup
+  req.on("close", () => {
+    const set = sseClientsByWaId.get(waId);
+    if (set) {
+      set.delete(res);
+      if (set.size === 0) sseClientsByWaId.delete(waId);
+    }
+  });
 });
 
-async function fetchScheduledEvents() {
-  const minStart = isoNow();
-  const maxStart = isoDaysFromNow(CALENDLY_LOOKAHEAD_DAYS);
+// =============================
+// WhatsApp Cloud API send helper
+// =============================
+async function sendWhatsAppText(toWaIdOrPhone, text) {
+  if (!WHATSAPP_ACCESS_TOKEN || !WHATSAPP_PHONE_NUMBER_ID) {
+    throw new Error("Missing WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID");
+  }
 
-  logDebug(`[SYNC] Fetch scheduled events from ${minStart} to ${maxStart}`);
+  const toClean = String(toWaIdOrPhone).replace(/\s/g, "");
+  const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
 
-  const res = await calendly.get("/scheduled_events", {
-    params: {
-      user: CALENDLY_USER_URI,
-      min_start_time: minStart,
-      max_start_time: maxStart,
-      sort: "start_time:asc",
-      status: "active",
+  const payload = {
+    messaging_product: "whatsapp",
+    to: toClean.startsWith("+") ? toClean.slice(1) : toClean, // Meta admite sin "+"
+    type: "text",
+    text: { body: text },
+  };
+
+  const resp = await axios.post(url, payload, {
+    headers: {
+      Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
     },
   });
 
-  return res.data.collection || [];
+  return resp.data;
 }
 
-async function fetchInviteesForEvent(eventUri) {
-  const parts = eventUri.split("/");
-  const uuid = parts[parts.length - 1];
-  const res = await calendly.get(`/scheduled_events/${uuid}/invitees`);
-  return res.data.collection || [];
-}
-
-// ===== Sync Logic: Calendly → Airtable =====
-async function syncCalendlyToAirtable() {
+// =============================
+// Portal → send message (humano)
+// =============================
+app.post("/portal/send", async (req, res) => {
   try {
-    if (!CALENDLY_PAT || !CALENDLY_USER_URI || !AIRTABLE_TOKEN || !AIRTABLE_BASE_ID || !AIRTABLE_TABLE_NAME) {
-      console.log("[SYNC] Missing env vars. Skipping.");
-      return;
+    const { wa_id, text } = req.body;
+    if (!wa_id || !text) {
+      return res.status(400).json({ ok: false, error: "Body must include { wa_id, text }" });
     }
 
-    console.log(`[SYNC] Running sync. Lookahead days=${CALENDLY_LOOKAHEAD_DAYS}`);
+    // 1) enviar por WhatsApp Cloud API
+    const data = await sendWhatsAppText(wa_id, text);
 
-    const events = await fetchScheduledEvents();
-    console.log(`[SYNC] Found ${events.length} events`);
-
-    for (const ev of events) {
-      const calendlyId = ev.uri;
-      const startTime = ev.start_time;
-
-      const invitees = await fetchInviteesForEvent(ev.uri);
-      const invitee = invitees[0];
-      if (!invitee) continue;
-
-      const name = invitee.name || "";
-      const questions = invitee.questions_and_answers || [];
-
-      const phoneRaw =
-        getAnswer(questions, "teléfono") ||
-        getAnswer(questions, "telefono") ||
-        invitee.text_reminder_number ||
-        null;
-
-      const phoneE164 = toE164Spain(phoneRaw);
-
-      const channelRaw =
-        getAnswer(questions, "canal") ||
-        getAnswer(questions, "contact") ||
-        getAnswer(questions, "¿cómo prefieres") ||
-        "WhatsApp";
-
-      const channel = normalizeChannel(channelRaw);
-
-      const fields = {
-        [AIRTABLE_CALENDLY_ID_FIELD]: calendlyId,
-        Nombre: name,
-        "Teléfono E164": phoneE164,
-        Fecha: startTime,
-        Canal: channel,
-        Status: "Programada",
-      };
-
-      const existing = await airtableFindByCalendlyId(calendlyId);
-
-      if (existing) {
-        await airtableUpdateAppointment(existing.id, fields);
-        log(`[SYNC] Updated: ${name}`);
-      } else {
-        await airtableCreateAppointment(fields);
-        log(`[SYNC] Created: ${name}`);
-      }
+    // 2) asegurar conversación existe
+    let convo = await airtableFindConversationByWaId(wa_id);
+    if (!convo) {
+      // si no existía, la creamos mínima
+      convo = await airtableCreateConversation({
+        [AIRTABLE_WA_ID_FIELD]: wa_id,
+        "Nombre": "",
+        [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
+        [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: isoNow(),
+        [AIRTABLE_WA_PHONE_NUMBER_ID_FIELD]: WHATSAPP_PHONE_NUMBER_ID,
+        [AIRTABLE_WA_STATUS_FIELD]: "Mensaje enviado",
+      });
+    } else {
+      // actualizar "último mensaje"
+      await airtableUpdateConversation(convo.id, {
+        [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
+        [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: isoNow(),
+        [AIRTABLE_WA_STATUS_FIELD]: "Mensaje enviado",
+      });
     }
 
-    console.log("[SYNC] Done.");
-  } catch (err) {
-    console.error("[SYNC] Error:", err?.response?.data || err.message);
-  }
-}
-
-// ===== Start polling =====
-const intervalMs = Number(CALENDLY_POLL_INTERVAL_MINUTES) * 60 * 1000;
-syncCalendlyToAirtable();
-setInterval(syncCalendlyToAirtable, intervalMs);
-
-// ===== WhatsApp Cloud API (test sender) =====
-app.post("/whatsapp/send-test", async (req, res) => {
-  try {
-    const { to, text } = req.body;
-    console.log("[WA-SEND] Using WHATSAPP_PHONE_NUMBER_ID =", WHATSAPP_PHONE_NUMBER_ID);
-
-    if (!WHATSAPP_ACCESS_TOKEN || !WHATSAPP_PHONE_NUMBER_ID) {
-      return res.status(500).json({ ok: false, error: "Missing WhatsApp env vars" });
-    }
-
-    if (!to || !text) {
-      return res.status(400).json({ ok: false, error: "Body must include { to, text }" });
-    }
-
-    const toClean = String(to).replace(/\s/g, "");
-
-    const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
-
-    const payload = {
-      messaging_product: "whatsapp",
-      to: toClean,
-      type: "text",
-      text: { body: text },
-    };
-
-    const resp = await axios.post(url, payload, {
-      headers: {
-        Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
-        "Content-Type": "application/json",
-      },
+    // 3) guardar mensaje OUT
+    const msgId = data?.messages?.[0]?.id || `out_${Date.now()}`;
+    await airtableCreateMessage({
+      [AIRTABLE_MSG_ID_FIELD]: msgId,
+      [AIRTABLE_MSG_DIRECTION_FIELD]: "OUT",
+      [AIRTABLE_MSG_WA_ID_FIELD]: wa_id,
+      [AIRTABLE_MSG_TEXT_FIELD]: text,
+      [AIRTABLE_MSG_DATE_FIELD]: isoNow(),
+      [AIRTABLE_MSG_CONVO_LINK_FIELD]: [convo.id],
     });
 
-    return res.status(200).json({ ok: true, data: resp.data });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err?.response?.data || err.message,
+    // 4) emitir por SSE
+    sseSend(wa_id, {
+      type: "message",
+      direction: "OUT",
+      message_id: msgId,
+      wa_id,
+      text,
+      date: isoNow(),
     });
+
+    return res.status(200).json({ ok: true, data });
+  } catch (e) {
+    console.error("[PORTAL-SEND] Error:", e?.response?.data || e.message);
+    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
   }
 });
 
-// ===== WhatsApp Webhook: verification =====
+// =============================
+// WhatsApp Webhook Verification
+// =============================
 app.get("/webhooks/whatsapp", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -383,12 +301,14 @@ app.get("/webhooks/whatsapp", (req, res) => {
   return res.sendStatus(403);
 });
 
-// ===== WhatsApp Webhook: incoming messages → Airtable (Conversations + Messages) =====
+// =============================
+// WhatsApp Webhook (IN) → Airtable + SSE
+// =============================
 app.post("/webhooks/whatsapp", async (req, res) => {
+  // Respondemos rápido (obligatorio)
   res.sendStatus(200);
 
   try {
-    console.log("[WA-WEBHOOK] ✅ VERSION GUARDAR AIRTABLE ACTIVA");
     const body = req.body;
     console.log("[WA-WEBHOOK] BODY ✅", JSON.stringify(body).slice(0, 800));
 
@@ -404,61 +324,69 @@ app.post("/webhooks/whatsapp", async (req, res) => {
         if (!messages.length) continue;
 
         const msg = messages[0];
-        const waId = msg.from; // "346..."
+        const waId = msg.from; // "346187..."
         const text = msg?.text?.body || "(no-text)";
-        const timestamp = msg.timestamp
+        const timestampIso = msg.timestamp
           ? new Date(Number(msg.timestamp) * 1000).toISOString()
-          : new Date().toISOString();
+          : isoNow();
 
         const phoneNumberId = value?.metadata?.phone_number_id || null;
         const contactName = contacts?.[0]?.profile?.name || "";
 
         console.log("[WA] Incoming message:", { waId, contactName, text });
 
-        // Convertimos waId en E164
-        const phoneE164 = waId.startsWith("+") ? waId : `+${waId}`;
-
-        // Buscar cita en 1er Contacto por teléfono
+        // 1) Buscar cita por teléfono E164 (+34...)
+        const phoneE164 = toE164FromWaId(waId);
         const appointment = await airtableFindAppointmentByPhone(phoneE164);
 
-        // Campos Conversaciones WhatsApp
+        // 2) Upsert conversación
         const convoFields = {
           [AIRTABLE_WA_ID_FIELD]: waId,
-          Nombre: contactName,
+          "Nombre": contactName,
           [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
-          [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: timestamp,
+          [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: timestampIso,
           [AIRTABLE_WA_PHONE_NUMBER_ID_FIELD]: phoneNumberId,
-          [AIRTABLE_WA_STATUS_FIELD]: "Abierta",
+          [AIRTABLE_WA_STATUS_FIELD]: "Programada", // o "Abierta" si prefieres
         };
 
         if (appointment) {
           convoFields[AIRTABLE_WA_LINK_FIELD] = [appointment.id];
         }
 
-        const existing = await airtableFindConversationByWaId(waId);
-        let convoRecord = null;
+        let convo = await airtableFindConversationByWaId(waId);
 
-        if (existing) {
-          convoRecord = await airtableUpdateConversation(existing.id, convoFields);
+        if (convo) {
+          convo = await airtableUpdateConversation(convo.id, convoFields);
           console.log("[WA] ✅ Updated conversation:", waId);
         } else {
-          convoRecord = await airtableCreateConversation(convoFields);
+          convo = await airtableCreateConversation(convoFields);
           console.log("[WA] ✅ Created conversation:", waId);
         }
 
-        // Guardar mensaje en tabla Mensajes WhatsApp
-        if (convoRecord?.id) {
-          await airtableCreateMessage({
-            message_id: msg.id,
-            direction: "IN",
-            wa_id: waId,
-            Texto: text,
-            Fecha: timestamp,
-            [AIRTABLE_MSG_CONVERSATION_FIELD]: [convoRecord.id],
-          });
+        // 3) Guardar mensaje IN en tabla Mensajes WhatsApp
+        const msgId = msg.id || `in_${Date.now()}`;
 
-          console.log("[WA] ✅ Saved message:", msg.id);
-        }
+        await airtableCreateMessage({
+          [AIRTABLE_MSG_ID_FIELD]: msgId,
+          [AIRTABLE_MSG_DIRECTION_FIELD]: "IN",
+          [AIRTABLE_MSG_WA_ID_FIELD]: waId,
+          [AIRTABLE_MSG_TEXT_FIELD]: text,
+          [AIRTABLE_MSG_DATE_FIELD]: timestampIso,
+          [AIRTABLE_MSG_CONVO_LINK_FIELD]: [convo.id],
+        });
+
+        console.log("[WA] ✅ Saved message:", msgId);
+
+        // 4) Emitir por SSE (portal en tiempo real)
+        sseSend(waId, {
+          type: "message",
+          direction: "IN",
+          message_id: msgId,
+          wa_id: waId,
+          name: contactName,
+          text,
+          date: timestampIso,
+        });
       }
     }
   } catch (e) {
@@ -466,7 +394,100 @@ app.post("/webhooks/whatsapp", async (req, res) => {
   }
 });
 
-// ✅ LISTEN AL FINAL (Render detecta el puerto)
+// =============================
+// Auto-close conversations (24h desde último IN del usuario)
+// =============================
+// Nota: para hacerlo perfecto habría que registrar "last_user_message_at" (solo IN).
+// Para simplificar ahora: usamos Fecha último mensaje, que se actualiza con IN y OUT.
+// Si quieres que sea estrictamente "último IN", te lo ajusto en 2 minutos.
+const AUTO_CLOSE_CHECK_MINUTES = 15;
+const AUTO_CLOSE_AFTER_HOURS = 24;
+
+async function autoCloseConversations() {
+  try {
+    // buscar conversaciones que NO estén cerradas
+    // y cuya "Fecha último mensaje" sea menor que now - 24h
+    const cutoff = new Date(Date.now() - AUTO_CLOSE_AFTER_HOURS * 60 * 60 * 1000).toISOString();
+
+    const formula = encodeURIComponent(
+      `AND({${AIRTABLE_WA_STATUS_FIELD}}!="Cerrada",{${AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD}}<"${cutoff}")`
+    );
+
+    const url = `${airtableConversationsUrl}?filterByFormula=${formula}&pageSize=50`;
+    const res = await axios.get(url, { headers: airtableHeaders() });
+
+    const records = res.data.records || [];
+    if (!records.length) return;
+
+    console.log(`[AUTO-CLOSE] Found ${records.length} conversations to close`);
+
+    for (const r of records) {
+      const waId = r.fields?.[AIRTABLE_WA_ID_FIELD];
+      if (!waId) continue;
+
+      // mensaje final (puedes cambiarlo a template cuando quieras)
+      const finalText =
+        "⏳ Hemos cerrado esta conversación. Si deseas volver a hablar con nosotros, por favor reserva otra cita en Calendly o escríbenos por correo.";
+
+      try {
+        // enviar WhatsApp (OUT)
+        await sendWhatsAppText(waId, finalText);
+
+        // guardar mensaje OUT
+        const msgId = `out_close_${Date.now()}`;
+        await airtableCreateMessage({
+          [AIRTABLE_MSG_ID_FIELD]: msgId,
+          [AIRTABLE_MSG_DIRECTION_FIELD]: "OUT",
+          [AIRTABLE_MSG_WA_ID_FIELD]: waId,
+          [AIRTABLE_MSG_TEXT_FIELD]: finalText,
+          [AIRTABLE_MSG_DATE_FIELD]: isoNow(),
+          [AIRTABLE_MSG_CONVO_LINK_FIELD]: [r.id],
+        });
+
+        // marcar cerrada
+        await airtableUpdateConversation(r.id, {
+          [AIRTABLE_WA_STATUS_FIELD]: "Cerrada",
+        });
+
+        // SSE
+        sseSend(waId, {
+          type: "conversation_closed",
+          wa_id: waId,
+          text: finalText,
+          date: isoNow(),
+        });
+
+        console.log("[AUTO-CLOSE] Closed:", waId);
+      } catch (e) {
+        console.error("[AUTO-CLOSE] Error closing:", waId, e?.response?.data || e.message);
+      }
+    }
+  } catch (e) {
+    console.error("[AUTO-CLOSE] Error:", e?.response?.data || e.message);
+  }
+}
+
+setInterval(autoCloseConversations, AUTO_CLOSE_CHECK_MINUTES * 60 * 1000);
+
+// =============================
+// (Opcional) WhatsApp test sender
+// =============================
+app.post("/whatsapp/send-test", async (req, res) => {
+  try {
+    const { to, text } = req.body;
+    if (!to || !text) return res.status(400).json({ ok: false, error: "Body must include { to, text }" });
+
+    const data = await sendWhatsAppText(to, text);
+    return res.status(200).json({ ok: true, data });
+  } catch (e) {
+    console.error("[WA-SEND] Error:", e?.response?.data || e.message);
+    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
+  }
+});
+
+// =============================
+// LISTEN (Render detecta el puerto)
+// =============================
 app.listen(PORT, () => {
   console.log("Server running on port", PORT, "TZ=", TZ, "NODE_ENV=", NODE_ENV);
 });
