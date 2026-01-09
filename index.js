@@ -371,71 +371,92 @@ app.get("/webhooks/whatsapp", (req, res) => {
   console.log("[WA-WEBHOOK] Verify failed ❌", { mode, token });
   return res.sendStatus(403);
 });
-
 // ===== WhatsApp Webhook: incoming messages → Airtable =====
 app.post("/webhooks/whatsapp", async (req, res) => {
+  // ✅ Respondemos rápido a Meta (obligatorio)
   res.sendStatus(200);
-  console.log("[WA-WEBHOOK] ✅ VERSION GUARDAR AIRTABLE ACTIVA");
 
-  try {
-    const body = req.body;
-    console.log("[WA-WEBHOOK] BODY ✅", JSON.stringify(body).slice(0, 800));
+  // ✅ Procesamos después para no bloquear la respuesta
+  setImmediate(async () => {
+    console.log("[WA-WEBHOOK] ✅ VERSION GUARDAR AIRTABLE ACTIVA");
 
-    if (!body?.entry?.length) return;
+    try {
+      const body = req.body;
+      console.log("[WA-WEBHOOK] BODY ✅", JSON.stringify(body).slice(0, 800));
 
-    for (const entry of body.entry) {
-      const changes = entry.changes || [];
-      for (const change of changes) {
-        const value = change.value || {};
-        const messages = value.messages || [];
-        const contacts = value.contacts || [];
+      if (!body?.entry?.length) return;
 
-        if (!messages.length) continue;
+      for (const entry of body.entry) {
+        const changes = entry.changes || [];
 
-        const msg = messages[0];
-        const waId = msg.from;
-        const text = msg?.text?.body || "(no-text)";
-        const timestamp = msg.timestamp
-          ? new Date(Number(msg.timestamp) * 1000).toISOString()
-          : new Date().toISOString();
+        for (const change of changes) {
+          const value = change.value || {};
+          const messages = value.messages || [];
+          const contacts = value.contacts || [];
 
-        const phoneNumberId = value?.metadata?.phone_number_id || null;
-        const contactName = contacts?.[0]?.profile?.name || "";
+          if (!messages.length) continue;
 
-        console.log("[WA] Incoming message:", { waId, contactName, text });
+          const msg = messages[0];
+          const waId = msg.from; // ej: "34618741246"
+          const text = msg?.text?.body || "(no-text)";
+          const timestamp = msg.timestamp
+            ? new Date(Number(msg.timestamp) * 1000).toISOString()
+            : new Date().toISOString();
 
-        const phoneE164 = waId.startsWith("+") ? waId : `+${waId}`;
-        const appointment = await airtableFindAppointmentByPhone(phoneE164);
+          const phoneNumberId = value?.metadata?.phone_number_id || null;
+          const contactName = contacts?.[0]?.profile?.name || "";
 
-        const fields = {
-          [AIRTABLE_WA_ID_FIELD]: waId,
-          "Nombre": contactName,
-          [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
-          [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: timestamp,
-          [AIRTABLE_WA_PHONE_NUMBER_ID_FIELD]: phoneNumberId,
-          [AIRTABLE_WA_STATUS_FIELD]: "Abierta",
-        };
+          console.log("[WA] Incoming message:", { waId, contactName, text, timestamp });
 
-        if (appointment) {
-          fields[AIRTABLE_WA_LINK_FIELD] = [appointment.id];
-        }
+          // Convertimos waId a E164 (+34...)
+          const phoneE164 = waId.startsWith("+") ? waId : `+${waId}`;
 
-        const existing = await airtableFindConversationByWaId(waId);
+          // Buscar cita en "1er Contacto" por Teléfono E164 (si existe)
+          let appointment = null;
+          try {
+            appointment = await airtableFindAppointmentByPhone(phoneE164);
+            console.log("[WA] Appointment found:", appointment ? appointment.id : "NONE");
+          } catch (e) {
+            console.error("[WA] ❌ Error buscando cita:", e?.response?.data || e.message);
+          }
 
-        if (existing) {
-          await airtableUpdateConversation(existing.id, fields);
-          console.log("[WA] ✅ Updated conversation:", waId);
-        } else {
-          await airtableCreateConversation(fields);
-          console.log("[WA] ✅ Created conversation:", waId);
+          // Campos para Conversaciones WhatsApp
+          const fields = {
+            [AIRTABLE_WA_ID_FIELD]: waId,
+            "Nombre": contactName,
+            [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
+            [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: timestamp,
+            [AIRTABLE_WA_PHONE_NUMBER_ID_FIELD]: phoneNumberId,
+            [AIRTABLE_WA_STATUS_FIELD]: "Abierta",
+          };
+
+          // ✅ SOLO añadir link si el campo existe y la cita existe
+          // ⚠️ IMPORTANTÍSIMO: AIRTABLE_WA_LINK_FIELD debe coincidir EXACTO con el nombre en Airtable
+          if (appointment && AIRTABLE_WA_LINK_FIELD) {
+            fields[AIRTABLE_WA_LINK_FIELD] = [appointment.id];
+          }
+
+          // Crear o actualizar conversación
+          try {
+            const existing = await airtableFindConversationByWaId(waId);
+
+            if (existing) {
+              await airtableUpdateConversation(existing.id, fields);
+              console.log("[WA] ✅ Updated conversation:", waId);
+            } else {
+              await airtableCreateConversation(fields);
+              console.log("[WA] ✅ Created conversation:", waId);
+            }
+          } catch (e) {
+            console.error("[WA] ❌ Error escribiendo conversación:", e?.response?.data || e.message);
+          }
         }
       }
+    } catch (e) {
+      console.error("[WA-WEBHOOK] ❌ Fatal error:", e?.response?.data || e.message);
     }
-  } catch (e) {
-    console.error("[WA-WEBHOOK] ❌ Error:", e?.response?.data || e.message);
-  }
+  });
 });
-
 // ✅ LISTEN AL FINAL (Render detecta el puerto)
 app.listen(PORT, () => {
   console.log("Server running on port", PORT, "TZ=", TZ, "NODE_ENV=", NODE_ENV);
