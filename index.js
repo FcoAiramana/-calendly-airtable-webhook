@@ -27,6 +27,15 @@ const {
   NODE_ENV = "development",
 } = process.env;
 
+  // WhatsApp conversations table
+  AIRTABLE_CONVERSATIONS_TABLE_NAME = "Conversaciones WhatsApp",
+  AIRTABLE_WA_ID_FIELD = "wa_id",
+  AIRTABLE_WA_LAST_MESSAGE_FIELD = "Último mensaje",
+  AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD = "Fecha último mensaje",
+  AIRTABLE_WA_PHONE_NUMBER_ID_FIELD = "Phone Number ID",
+  AIRTABLE_WA_STATUS_FIELD = "Estado conversación",
+  AIRTABLE_WA_LINK_FIELD = "Cita",
+
 // ===== Basic routes =====
 app.get("/", (req, res) =>
   res.status(200).send("Calendly → Airtable sync service running")
