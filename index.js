@@ -304,6 +304,9 @@ app.post("/whatsapp/send-test", async (req, res) => {
 // ===== WhatsApp Webhook (verification + incoming messages) =====
 const { WHATSAPP_VERIFY_TOKEN } = process.env;
 
+// IMPORTANTE: Express debe parsear JSON ANTES de cualquier POST
+app.use(express.json());
+
 // 1) Verificación del webhook (Meta llama a este endpoint al conectar)
 app.get("/webhooks/whatsapp", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -311,40 +314,22 @@ app.get("/webhooks/whatsapp", (req, res) => {
   const challenge = req.query["hub.challenge"];
 
   if (mode === "subscribe" && token === WHATSAPP_VERIFY_TOKEN) {
+    console.log("[WA-WEBHOOK] Verified ✅");
     return res.status(200).send(challenge);
   }
+
+  console.log("[WA-WEBHOOK] Verify failed ❌", { mode, token });
   return res.sendStatus(403);
 });
 
 // 2) Recepción de eventos (mensajes entrantes, delivery, etc.)
 app.post("/webhooks/whatsapp", (req, res) => {
-  // Respondemos rápido a Meta
   res.sendStatus(200);
 
   try {
-    const body = req.body;
-
-    // Aquí luego procesaremos mensajes entrantes
-    console.log("[WA] Incoming:", JSON.stringify(body));
+    console.log("[WA-WEBHOOK] POST ✅ content-type:", req.headers["content-type"]);
+    console.log("[WA-WEBHOOK] BODY ✅", JSON.stringify(req.body).slice(0, 800));
   } catch (e) {
-    console.error("[WA] Error parsing webhook:", e.message);
+    console.error("[WA-WEBHOOK] Error parsing webhook:", e.message);
   }
-});
-
-
-// 2) Recepción de eventos (mensajes entrantes, delivery, etc.)
-app.post("/webhooks/whatsapp", (req, res) => {
-  // Respondemos rápido a Meta
-  res.sendStatus(200);
-
-  try {
-    const body = req.body;
-    console.log("[WA] Incoming:", JSON.stringify(body));
-  } catch (e) {
-    console.error("[WA] Error parsing webhook:", e.message);
-  }
-});
-
-app.listen(PORT, () => {
-  console.log("Server running on port", PORT, "TZ=", TZ, "NODE_ENV=", NODE_ENV);
 });
