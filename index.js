@@ -4,7 +4,7 @@ const axios = require("axios");
 
 const app = express();
 
-// ✅ Parsear JSON una sola vez (suficiente para todos los POST)
+// ✅ Parsear JSON una sola vez (vale para todos los POST)
 app.use(express.json({ limit: "1mb" }));
 
 // ✅ Render necesita usar process.env.PORT
@@ -12,22 +12,19 @@ const PORT = process.env.PORT || 3000;
 
 // ===== ENV =====
 const {
+  // Calendly
   CALENDLY_PAT,
   CALENDLY_USER_URI,
   CALENDLY_POLL_INTERVAL_MINUTES = "5",
   CALENDLY_LOOKAHEAD_DAYS = "14",
 
+  // Airtable
   AIRTABLE_TOKEN,
   AIRTABLE_BASE_ID,
   AIRTABLE_TABLE_NAME,
   AIRTABLE_CALENDLY_ID_FIELD = "ID Calendly",
 
-  TZ = "Europe/Madrid",
-  LOG_LEVEL = "info",
-  NODE_ENV = "development",
-} = process.env;
-
-  // WhatsApp conversations table
+  // WhatsApp Conversations table (Airtable)
   AIRTABLE_CONVERSATIONS_TABLE_NAME = "Conversaciones WhatsApp",
   AIRTABLE_WA_ID_FIELD = "wa_id",
   AIRTABLE_WA_LAST_MESSAGE_FIELD = "Último mensaje",
@@ -35,6 +32,18 @@ const {
   AIRTABLE_WA_PHONE_NUMBER_ID_FIELD = "Phone Number ID",
   AIRTABLE_WA_STATUS_FIELD = "Estado conversación",
   AIRTABLE_WA_LINK_FIELD = "Cita",
+
+  // WhatsApp Cloud API
+  WHATSAPP_ACCESS_TOKEN,
+  WHATSAPP_PHONE_NUMBER_ID,
+  WHATSAPP_VERIFY_TOKEN,
+  META_GRAPH_VERSION = "v24.0",
+
+  // General
+  TZ = "Europe/Madrid",
+  LOG_LEVEL = "info",
+  NODE_ENV = "development",
+} = process.env;
 
 // ===== Basic routes =====
 app.get("/", (req, res) =>
@@ -83,11 +92,9 @@ function normalizeChannel(raw) {
   if (!raw) return "Whatsapp";
   const t = raw.toLowerCase();
 
-  // Whatsapp (tal cual está en Airtable)
   if (t.includes("whatsapp")) return "Whatsapp";
   if (t.includes("por whatsapp")) return "Whatsapp";
 
-  // Llamada Telefónica (tal cual está en Airtable)
   if (t.includes("llamada")) return "Llamada Telefónica";
   if (t.includes("teléfono") || t.includes("telefono")) return "Llamada Telefónica";
 
@@ -95,13 +102,13 @@ function normalizeChannel(raw) {
 }
 
 // ===== Airtable API =====
-const airtableBaseUrl = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
+const airtableAppointmentsUrl = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
   AIRTABLE_TABLE_NAME || ""
 )}`;
 
 async function airtableFindByCalendlyId(calendlyId) {
   const formula = encodeURIComponent(`{${AIRTABLE_CALENDLY_ID_FIELD}}="${calendlyId}"`);
-  const url = `${airtableBaseUrl}?filterByFormula=${formula}`;
+  const url = `${airtableAppointmentsUrl}?filterByFormula=${formula}`;
 
   const res = await axios.get(url, {
     headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` },
@@ -112,7 +119,7 @@ async function airtableFindByCalendlyId(calendlyId) {
 
 async function airtableCreate(fields) {
   const res = await axios.post(
-    airtableBaseUrl,
+    airtableAppointmentsUrl,
     { records: [{ fields }] },
     {
       headers: {
@@ -126,7 +133,7 @@ async function airtableCreate(fields) {
 
 async function airtableUpdate(recordId, fields) {
   const res = await axios.patch(
-    airtableBaseUrl,
+    airtableAppointmentsUrl,
     { records: [{ id: recordId, fields }] },
     {
       headers: {
@@ -136,6 +143,61 @@ async function airtableUpdate(recordId, fields) {
     }
   );
   return res.data.records?.[0];
+}
+
+// ===== Airtable: WhatsApp Conversations =====
+const airtableConversationsUrl = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
+  AIRTABLE_CONVERSATIONS_TABLE_NAME
+)}`;
+
+async function airtableFindConversationByWaId(waId) {
+  const formula = encodeURIComponent(`{${AIRTABLE_WA_ID_FIELD}}="${waId}"`);
+  const url = `${airtableConversationsUrl}?filterByFormula=${formula}`;
+
+  const res = await axios.get(url, {
+    headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` },
+  });
+
+  return res.data.records?.[0] || null;
+}
+
+async function airtableCreateConversation(fields) {
+  const res = await axios.post(
+    airtableConversationsUrl,
+    { records: [{ fields }] },
+    {
+      headers: {
+        Authorization: `Bearer ${AIRTABLE_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+  return res.data.records?.[0];
+}
+
+async function airtableUpdateConversation(recordId, fields) {
+  const res = await axios.patch(
+    airtableConversationsUrl,
+    { records: [{ id: recordId, fields }] },
+    {
+      headers: {
+        Authorization: `Bearer ${AIRTABLE_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+  return res.data.records?.[0];
+}
+
+async function airtableFindAppointmentByPhone(phoneE164) {
+  const formula = encodeURIComponent(`{Teléfono E164}="${phoneE164}"`);
+  const url = `${airtableAppointmentsUrl}?filterByFormula=${formula}`;
+
+  const res = await axios.get(url, {
+    headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` },
+  });
+
+  return res.data.records?.[0] || null;
 }
 
 // ===== Calendly API =====
@@ -223,11 +285,11 @@ async function syncCalendlyToAirtable() {
 
       const fields = {
         [AIRTABLE_CALENDLY_ID_FIELD]: calendlyId,
-        Nombre: name,
+        "Nombre": name,
         "Teléfono E164": phoneE164,
-        Fecha: startTime,
-        Canal: channel,
-        Status: "Programada",
+        "Fecha": startTime,
+        "Canal": channel,
+        "Status": "Programada",
       };
 
       const existing = await airtableFindByCalendlyId(calendlyId);
@@ -249,25 +311,19 @@ async function syncCalendlyToAirtable() {
 
 // ===== Start polling =====
 const intervalMs = Number(CALENDLY_POLL_INTERVAL_MINUTES) * 60 * 1000;
-
 syncCalendlyToAirtable();
 setInterval(syncCalendlyToAirtable, intervalMs);
 
-// Endpoint por si en el futuro tienes Webhooks en Calendly
+// ===== Calendly webhook placeholder =====
 app.post("/webhooks/calendly", async (req, res) => {
   return res.status(200).json({ ok: true });
 });
 
-// ===== WhatsApp Cloud API (test sender) =====
-const {
-  WHATSAPP_ACCESS_TOKEN,
-  WHATSAPP_PHONE_NUMBER_ID,
-  META_GRAPH_VERSION = "v24.0",
-} = process.env;
-
+// ===== WhatsApp: Send test message =====
 app.post("/whatsapp/send-test", async (req, res) => {
   try {
     const { to, text } = req.body;
+
     console.log("[WA-SEND] Using WHATSAPP_PHONE_NUMBER_ID =", WHATSAPP_PHONE_NUMBER_ID);
 
     if (!WHATSAPP_ACCESS_TOKEN || !WHATSAPP_PHONE_NUMBER_ID) {
@@ -279,7 +335,6 @@ app.post("/whatsapp/send-test", async (req, res) => {
     }
 
     const toClean = String(to).replace(/\s/g, "");
-
     const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
 
     const payload = {
@@ -298,17 +353,11 @@ app.post("/whatsapp/send-test", async (req, res) => {
 
     return res.status(200).json({ ok: true, data: resp.data });
   } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: err?.response?.data || err.message,
-    });
+    return res.status(500).json({ ok: false, error: err?.response?.data || err.message });
   }
 });
 
-// ===== WhatsApp Webhook (verification + incoming messages) =====
-const WHATSAPP_VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
-
-// 1) Verificación del webhook
+// ===== WhatsApp Webhook: verification =====
 app.get("/webhooks/whatsapp", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -323,14 +372,67 @@ app.get("/webhooks/whatsapp", (req, res) => {
   return res.sendStatus(403);
 });
 
-// 2) Recepción de eventos
-app.post("/webhooks/whatsapp", (req, res) => {
+// ===== WhatsApp Webhook: incoming messages → Airtable =====
+app.post("/webhooks/whatsapp", async (req, res) => {
   res.sendStatus(200);
+  console.log("[WA-WEBHOOK] ✅ VERSION GUARDAR AIRTABLE ACTIVA");
+
   try {
-    console.log("[WA-WEBHOOK] POST ✅ content-type:", req.headers["content-type"]);
-    console.log("[WA-WEBHOOK] BODY ✅", JSON.stringify(req.body).slice(0, 800));
+    const body = req.body;
+    console.log("[WA-WEBHOOK] BODY ✅", JSON.stringify(body).slice(0, 800));
+
+    if (!body?.entry?.length) return;
+
+    for (const entry of body.entry) {
+      const changes = entry.changes || [];
+      for (const change of changes) {
+        const value = change.value || {};
+        const messages = value.messages || [];
+        const contacts = value.contacts || [];
+
+        if (!messages.length) continue;
+
+        const msg = messages[0];
+        const waId = msg.from;
+        const text = msg?.text?.body || "(no-text)";
+        const timestamp = msg.timestamp
+          ? new Date(Number(msg.timestamp) * 1000).toISOString()
+          : new Date().toISOString();
+
+        const phoneNumberId = value?.metadata?.phone_number_id || null;
+        const contactName = contacts?.[0]?.profile?.name || "";
+
+        console.log("[WA] Incoming message:", { waId, contactName, text });
+
+        const phoneE164 = waId.startsWith("+") ? waId : `+${waId}`;
+        const appointment = await airtableFindAppointmentByPhone(phoneE164);
+
+        const fields = {
+          [AIRTABLE_WA_ID_FIELD]: waId,
+          "Nombre": contactName,
+          [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
+          [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: timestamp,
+          [AIRTABLE_WA_PHONE_NUMBER_ID_FIELD]: phoneNumberId,
+          [AIRTABLE_WA_STATUS_FIELD]: "Abierta",
+        };
+
+        if (appointment) {
+          fields[AIRTABLE_WA_LINK_FIELD] = [appointment.id];
+        }
+
+        const existing = await airtableFindConversationByWaId(waId);
+
+        if (existing) {
+          await airtableUpdateConversation(existing.id, fields);
+          console.log("[WA] ✅ Updated conversation:", waId);
+        } else {
+          await airtableCreateConversation(fields);
+          console.log("[WA] ✅ Created conversation:", waId);
+        }
+      }
+    }
   } catch (e) {
-    console.error("[WA-WEBHOOK] Error parsing webhook:", e.message);
+    console.error("[WA-WEBHOOK] ❌ Error:", e?.response?.data || e.message);
   }
 });
 
