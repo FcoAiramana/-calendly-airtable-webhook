@@ -302,6 +302,37 @@ app.post("/portal/send", portalAuth, async (req, res) => {
 });
 
 // =============================
+// Portal → listar conversaciones abiertas
+// =============================
+app.get("/portal/conversations", async (req, res) => {
+  try {
+    const formula = encodeURIComponent(
+      `{${AIRTABLE_WA_STATUS_FIELD}}!="Cerrada"`
+    );
+
+    const url = `${airtableConversationsUrl}?filterByFormula=${formula}&sort[0][field]=${encodeURIComponent(
+      AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD
+    )}&sort[0][direction]=desc&pageSize=50`;
+
+    const r = await axios.get(url, { headers: airtableHeaders() });
+
+    const items = (r.data.records || []).map((rec) => ({
+      id: rec.id,
+      wa_id: rec.fields?.[AIRTABLE_WA_ID_FIELD],
+      nombre: rec.fields?.["Nombre"] || "",
+      ultimo: rec.fields?.[AIRTABLE_WA_LAST_MESSAGE_FIELD] || "",
+      fecha: rec.fields?.[AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD] || "",
+      estado: rec.fields?.[AIRTABLE_WA_STATUS_FIELD] || "",
+    }));
+
+    res.json({ ok: true, items });
+  } catch (e) {
+    console.error("[PORTAL-CONVERSATIONS] Error:", e?.response?.data || e.message);
+    res.status(500).json({ ok: false, error: e?.response?.data || e.message });
+  }
+});
+
+// =============================
 // WhatsApp Webhook Verification
 // =============================
 app.get("/webhooks/whatsapp", (req, res) => {
