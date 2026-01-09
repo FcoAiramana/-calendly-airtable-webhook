@@ -175,6 +175,7 @@ app.get("/sse", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
 
   if (PORTAL_ALLOWED_ORIGIN) {
     res.setHeader("Access-Control-Allow-Origin", PORTAL_ALLOWED_ORIGIN);
@@ -484,6 +485,44 @@ app.post("/whatsapp/send-test", async (req, res) => {
     return res.status(200).json({ ok: true, data });
   } catch (e) {
     console.error("[WA-SEND] Error:", e?.response?.data || e.message);
+    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
+  }
+});
+// =============================
+// Portal → get messages (chat history)
+// =============================
+app.get("/portal/messages", async (req, res) => {
+  try {
+    const waId = String(req.query.wa_id || "").trim();
+    if (!waId) return res.status(400).json({ ok: false, error: "Missing wa_id" });
+
+    // 1) buscar conversación
+    const convo = await airtableFindConversationByWaId(waId);
+    if (!convo) return res.status(200).json({ ok: true, items: [] });
+
+    const convoId = convo.id;
+
+    // 2) buscar mensajes vinculados a esta conversación
+    const formula = encodeURIComponent(`{${AIRTABLE_MSG_CONVO_LINK_FIELD}}="${convoId}"`);
+    const url = `${airtableMessagesUrl}?filterByFormula=${formula}&sort[0][field]=${encodeURIComponent(
+      AIRTABLE_MSG_DATE_FIELD
+    )}&sort[0][direction]=asc&pageSize=100`;
+
+    const r = await axios.get(url, { headers: airtableHeaders() });
+
+    const items =
+      (r.data.records || []).map((rec) => ({
+        message_id: rec.fields?.[AIRTABLE_MSG_ID_FIELD] || rec.id,
+        direction: rec.fields?.[AIRTABLE_MSG_DIRECTION_FIELD] || "IN",
+        wa_id: rec.fields?.[AIRTABLE_MSG_WA_ID_FIELD] || waId,
+        text: rec.fields?.[AIRTABLE_MSG_TEXT_FIELD] || "",
+        date: rec.fields?.[AIRTABLE_MSG_DATE_FIELD] || "",
+        convo_id: convoId,
+      })) || [];
+
+    return res.status(200).json({ ok: true, items });
+  } catch (e) {
+    console.error("[PORTAL-MESSAGES] Error:", e?.response?.data || e.message);
     return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
   }
 });
