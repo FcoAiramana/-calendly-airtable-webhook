@@ -31,7 +31,7 @@ const {
   AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD = "Fecha último mensaje",
   AIRTABLE_WA_PHONE_NUMBER_ID_FIELD = "Phone Number ID",
   AIRTABLE_WA_STATUS_FIELD = "Estado conversación",
-  AIRTABLE_WA_LINK_FIELD = "Cita",
+  AIRTABLE_WA_LINK_FIELD = "Cita (link)",
 
   // WhatsApp Cloud API
   WHATSAPP_ACCESS_TOKEN,
