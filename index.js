@@ -5,20 +5,24 @@ const axios = require("axios");
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ✅ Render necesita process.env.PORT
+// ✅ CORS (necesario para SSE + Portal en Vercel)
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
+
 const PORT = process.env.PORT || 3000;
 
 // ===== ENV =====
 const {
-  // Calendly
-  CALENDLY_PAT,
-  CALENDLY_USER_URI,
-  CALENDLY_POLL_INTERVAL_MINUTES = "5",
-  CALENDLY_LOOKAHEAD_DAYS = "14",
-
-  // Airtable (citas)
+  // Airtable (token/base)
   AIRTABLE_TOKEN,
   AIRTABLE_BASE_ID,
+
+  // Airtable (citas)
   AIRTABLE_TABLE_NAME,
   AIRTABLE_CALENDLY_ID_FIELD = "ID Calendly",
 
@@ -46,14 +50,20 @@ const {
   WHATSAPP_VERIFY_TOKEN,
   META_GRAPH_VERSION = "v24.0",
 
+  // Seguridad portal
+  PORTAL_API_KEY,
+  PORTAL_ALLOWED_ORIGIN,
+
   TZ = "Europe/Madrid",
   LOG_LEVEL = "info",
   NODE_ENV = "development",
 } = process.env;
 
-// ===== Basic routes =====
+// =============================
+// Basic routes
+// =============================
 app.get("/", (req, res) =>
-  res.status(200).send("Calendly → Airtable sync + WhatsApp webhook service running")
+  res.status(200).send("ACE backend: WhatsApp webhook + Airtable + SSE running")
 );
 app.get("/health", (req, res) => res.status(200).send("OK"));
 
@@ -63,28 +73,19 @@ app.get("/health", (req, res) => res.status(200).send("OK"));
 function isoNow() {
   return new Date().toISOString();
 }
-
-function isoDaysFromNow(days) {
-  const d = new Date();
-  d.setDate(d.getDate() + Number(days));
-  return d.toISOString();
-}
-
 function log(...args) {
   if (LOG_LEVEL === "debug" || LOG_LEVEL === "info") console.log(...args);
 }
 function logDebug(...args) {
   if (LOG_LEVEL === "debug") console.log(...args);
 }
-
-// Convert wa_id "346187..." to E164 "+346187..."
 function toE164FromWaId(waId) {
   if (!waId) return null;
   return waId.startsWith("+") ? waId : `+${waId}`;
 }
 
 // =============================
-// Airtable API helpers
+// Airtable helpers
 // =============================
 function airtableHeaders() {
   return {
@@ -140,7 +141,7 @@ async function airtableUpdateConversation(recordId, fields) {
   return res.data.records?.[0];
 }
 
-// ---- Mensajes: crear siempre ----
+// ---- Mensajes: crear siempre (histórico) ----
 async function airtableCreateMessage(fields) {
   const res = await axios.post(
     airtableMessagesUrl,
@@ -151,7 +152,7 @@ async function airtableCreateMessage(fields) {
 }
 
 // =============================
-// SSE: Tiempo real (Portal)
+// SSE: Tiempo real para Portal
 // =============================
 const sseClientsByWaId = new Map(); // wa_id -> Set(res)
 
@@ -167,7 +168,6 @@ function sseSend(waId, event) {
   }
 }
 
-// ✅ Portal se conecta aquí para recibir updates en tiempo real
 app.get("/sse", (req, res) => {
   const waId = String(req.query.wa_id || "").trim();
   if (!waId) return res.status(400).send("Missing wa_id");
@@ -175,16 +175,18 @@ app.get("/sse", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
+
+  if (PORTAL_ALLOWED_ORIGIN) {
+    res.setHeader("Access-Control-Allow-Origin", PORTAL_ALLOWED_ORIGIN);
+  }
+
   res.flushHeaders?.();
 
-  // registrar cliente
   if (!sseClientsByWaId.has(waId)) sseClientsByWaId.set(waId, new Set());
   sseClientsByWaId.get(waId).add(res);
 
-  // mensaje inicial
   res.write(`data: ${JSON.stringify({ type: "connected", waId, ts: isoNow() })}\n\n`);
 
-  // cleanup
   req.on("close", () => {
     const set = sseClientsByWaId.get(waId);
     if (set) {
@@ -207,7 +209,7 @@ async function sendWhatsAppText(toWaIdOrPhone, text) {
 
   const payload = {
     messaging_product: "whatsapp",
-    to: toClean.startsWith("+") ? toClean.slice(1) : toClean, // Meta admite sin "+"
+    to: toClean.startsWith("+") ? toClean.slice(1) : toClean,
     type: "text",
     text: { body: text },
   };
@@ -223,22 +225,36 @@ async function sendWhatsAppText(toWaIdOrPhone, text) {
 }
 
 // =============================
+// Seguridad portal (API key)
+// =============================
+function portalAuth(req, res, next) {
+  if (!PORTAL_API_KEY) {
+    console.log("[SECURITY] ⚠️ Missing PORTAL_API_KEY in env");
+    return res.status(500).json({ ok: false, error: "Server misconfigured" });
+  }
+
+  const key = req.headers["x-api-key"];
+  if (!key || key !== PORTAL_API_KEY) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  next();
+}
+
+// =============================
 // Portal → send message (humano)
 // =============================
-app.post("/portal/send", async (req, res) => {
+app.post("/portal/send", portalAuth, async (req, res) => {
   try {
     const { wa_id, text } = req.body;
     if (!wa_id || !text) {
       return res.status(400).json({ ok: false, error: "Body must include { wa_id, text }" });
     }
 
-    // 1) enviar por WhatsApp Cloud API
     const data = await sendWhatsAppText(wa_id, text);
 
-    // 2) asegurar conversación existe
+    // conversación
     let convo = await airtableFindConversationByWaId(wa_id);
     if (!convo) {
-      // si no existía, la creamos mínima
       convo = await airtableCreateConversation({
         [AIRTABLE_WA_ID_FIELD]: wa_id,
         "Nombre": "",
@@ -248,7 +264,6 @@ app.post("/portal/send", async (req, res) => {
         [AIRTABLE_WA_STATUS_FIELD]: "Mensaje enviado",
       });
     } else {
-      // actualizar "último mensaje"
       await airtableUpdateConversation(convo.id, {
         [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
         [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: isoNow(),
@@ -256,8 +271,9 @@ app.post("/portal/send", async (req, res) => {
       });
     }
 
-    // 3) guardar mensaje OUT
+    // mensaje OUT
     const msgId = data?.messages?.[0]?.id || `out_${Date.now()}`;
+
     await airtableCreateMessage({
       [AIRTABLE_MSG_ID_FIELD]: msgId,
       [AIRTABLE_MSG_DIRECTION_FIELD]: "OUT",
@@ -267,7 +283,7 @@ app.post("/portal/send", async (req, res) => {
       [AIRTABLE_MSG_CONVO_LINK_FIELD]: [convo.id],
     });
 
-    // 4) emitir por SSE
+    // SSE
     sseSend(wa_id, {
       type: "message",
       direction: "OUT",
@@ -305,26 +321,22 @@ app.get("/webhooks/whatsapp", (req, res) => {
 // WhatsApp Webhook (IN) → Airtable + SSE
 // =============================
 app.post("/webhooks/whatsapp", async (req, res) => {
-  // Respondemos rápido (obligatorio)
   res.sendStatus(200);
 
   try {
     const body = req.body;
     console.log("[WA-WEBHOOK] BODY ✅", JSON.stringify(body).slice(0, 800));
-
     if (!body?.entry?.length) return;
 
     for (const entry of body.entry) {
-      const changes = entry.changes || [];
-      for (const change of changes) {
+      for (const change of entry.changes || []) {
         const value = change.value || {};
         const messages = value.messages || [];
         const contacts = value.contacts || [];
-
         if (!messages.length) continue;
 
         const msg = messages[0];
-        const waId = msg.from; // "346187..."
+        const waId = msg.from;
         const text = msg?.text?.body || "(no-text)";
         const timestampIso = msg.timestamp
           ? new Date(Number(msg.timestamp) * 1000).toISOString()
@@ -335,18 +347,19 @@ app.post("/webhooks/whatsapp", async (req, res) => {
 
         console.log("[WA] Incoming message:", { waId, contactName, text });
 
-        // 1) Buscar cita por teléfono E164 (+34...)
         const phoneE164 = toE164FromWaId(waId);
         const appointment = await airtableFindAppointmentByPhone(phoneE164);
 
-        // 2) Upsert conversación
+        // estado según cita
+        const status = appointment ? "Programada" : "Mensaje enviado";
+
         const convoFields = {
           [AIRTABLE_WA_ID_FIELD]: waId,
           "Nombre": contactName,
           [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
           [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: timestampIso,
           [AIRTABLE_WA_PHONE_NUMBER_ID_FIELD]: phoneNumberId,
-          [AIRTABLE_WA_STATUS_FIELD]: "Programada", // o "Abierta" si prefieres
+          [AIRTABLE_WA_STATUS_FIELD]: status,
         };
 
         if (appointment) {
@@ -354,7 +367,6 @@ app.post("/webhooks/whatsapp", async (req, res) => {
         }
 
         let convo = await airtableFindConversationByWaId(waId);
-
         if (convo) {
           convo = await airtableUpdateConversation(convo.id, convoFields);
           console.log("[WA] ✅ Updated conversation:", waId);
@@ -363,7 +375,7 @@ app.post("/webhooks/whatsapp", async (req, res) => {
           console.log("[WA] ✅ Created conversation:", waId);
         }
 
-        // 3) Guardar mensaje IN en tabla Mensajes WhatsApp
+        // guardar mensaje IN
         const msgId = msg.id || `in_${Date.now()}`;
 
         await airtableCreateMessage({
@@ -377,7 +389,7 @@ app.post("/webhooks/whatsapp", async (req, res) => {
 
         console.log("[WA] ✅ Saved message:", msgId);
 
-        // 4) Emitir por SSE (portal en tiempo real)
+        // SSE
         sseSend(waId, {
           type: "message",
           direction: "IN",
@@ -395,18 +407,13 @@ app.post("/webhooks/whatsapp", async (req, res) => {
 });
 
 // =============================
-// Auto-close conversations (24h desde último IN del usuario)
+// Auto-close (24h desde último mensaje)
 // =============================
-// Nota: para hacerlo perfecto habría que registrar "last_user_message_at" (solo IN).
-// Para simplificar ahora: usamos Fecha último mensaje, que se actualiza con IN y OUT.
-// Si quieres que sea estrictamente "último IN", te lo ajusto en 2 minutos.
 const AUTO_CLOSE_CHECK_MINUTES = 15;
 const AUTO_CLOSE_AFTER_HOURS = 24;
 
 async function autoCloseConversations() {
   try {
-    // buscar conversaciones que NO estén cerradas
-    // y cuya "Fecha último mensaje" sea menor que now - 24h
     const cutoff = new Date(Date.now() - AUTO_CLOSE_AFTER_HOURS * 60 * 60 * 1000).toISOString();
 
     const formula = encodeURIComponent(
@@ -425,16 +432,14 @@ async function autoCloseConversations() {
       const waId = r.fields?.[AIRTABLE_WA_ID_FIELD];
       if (!waId) continue;
 
-      // mensaje final (puedes cambiarlo a template cuando quieras)
       const finalText =
         "⏳ Hemos cerrado esta conversación. Si deseas volver a hablar con nosotros, por favor reserva otra cita en Calendly o escríbenos por correo.";
 
       try {
-        // enviar WhatsApp (OUT)
         await sendWhatsAppText(waId, finalText);
 
-        // guardar mensaje OUT
         const msgId = `out_close_${Date.now()}`;
+
         await airtableCreateMessage({
           [AIRTABLE_MSG_ID_FIELD]: msgId,
           [AIRTABLE_MSG_DIRECTION_FIELD]: "OUT",
@@ -444,12 +449,10 @@ async function autoCloseConversations() {
           [AIRTABLE_MSG_CONVO_LINK_FIELD]: [r.id],
         });
 
-        // marcar cerrada
         await airtableUpdateConversation(r.id, {
           [AIRTABLE_WA_STATUS_FIELD]: "Cerrada",
         });
 
-        // SSE
         sseSend(waId, {
           type: "conversation_closed",
           wa_id: waId,
@@ -470,7 +473,7 @@ async function autoCloseConversations() {
 setInterval(autoCloseConversations, AUTO_CLOSE_CHECK_MINUTES * 60 * 1000);
 
 // =============================
-// (Opcional) WhatsApp test sender
+// WhatsApp test sender
 // =============================
 app.post("/whatsapp/send-test", async (req, res) => {
   try {
@@ -486,7 +489,7 @@ app.post("/whatsapp/send-test", async (req, res) => {
 });
 
 // =============================
-// LISTEN (Render detecta el puerto)
+// LISTEN
 // =============================
 app.listen(PORT, () => {
   console.log("Server running on port", PORT, "TZ=", TZ, "NODE_ENV=", NODE_ENV);
