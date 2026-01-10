@@ -11,17 +11,17 @@ app.use(express.json({ limit: "1mb" }));
 // ✅ CORS dinámico: permite localhost + vercel + otros que añadas
 const ALLOWED_ORIGINS = [
   "http://localhost:3000",
-  "https://ace-project-7vyqhwex2-pacos-projects-47780fd7.vercel.app",
+  // añade aquí tu dominio final de Vercel cuando lo tengas
+  // "https://ace-project.vercel.app",
 ];
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
 
-  // Si viene origin y está en whitelist => lo devolvemos
   if (origin && ALLOWED_ORIGINS.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   } else {
-    // fallback (opcional) para curl/postman
+    // fallback útil para curl/postman
     res.setHeader("Access-Control-Allow-Origin", "*");
   }
 
@@ -29,9 +29,7 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Credentials", "true");
 
-  // ✅ Preflight responde aquí siempre
   if (req.method === "OPTIONS") return res.sendStatus(200);
-
   next();
 });
 
@@ -89,6 +87,10 @@ app.get("/", (req, res) =>
   res.status(200).send("ACE backend: WhatsApp webhook + Airtable + SSE running")
 );
 app.get("/health", (req, res) => res.status(200).send("OK"));
+
+// ✅ Mensaje automático cuando está cerrada
+const CLOSED_AUTO_REPLY =
+  "⛔ Esta conversación está cerrada.\n\nSi deseas volver a hablar con nosotros, por favor reserva otra cita en Calendly o escríbenos por correo.";
 
 // ===================================
 // Helpers
@@ -173,14 +175,18 @@ async function airtableCreateMessage(fields) {
   return res.data.records?.[0];
 }
 
-// ✅ Listar mensajes por wa_id (CORRECTO)
-async function airtableListMessagesByWaId(waId, limit = 200) {
+// ✅ Listar mensajes por wa_id (MAX pageSize 100)
+async function airtableListMessagesByWaId(waId, limit = 100) {
+  const pageSize = 100;
   const formula = encodeURIComponent(`{${AIRTABLE_MSG_WA_ID_FIELD}}="${waId}"`);
-  const sort = `sort[0][field]=${encodeURIComponent(AIRTABLE_MSG_DATE_FIELD)}&sort[0][direction]=asc`;
-  const url = `${airtableMessagesUrl}?filterByFormula=${formula}&pageSize=${limit}&${sort}`;
+  const sort = `sort[0][field]=${encodeURIComponent(
+    AIRTABLE_MSG_DATE_FIELD
+  )}&sort[0][direction]=asc`;
 
+  const url = `${airtableMessagesUrl}?filterByFormula=${formula}&pageSize=${pageSize}&${sort}`;
   const res = await axios.get(url, { headers: airtableHeaders() });
-  return res.data.records || [];
+
+  return (res.data.records || []).slice(0, limit);
 }
 
 // ===================================
@@ -271,130 +277,13 @@ function portalAuth(req, res, next) {
 }
 
 // ===================================
-// Portal → send message (OUT)
-// ===================================
-app.post("/portal/send", portalAuth, async (req, res) => {
-  try {
-    const { wa_id, text } = req.body;
-    if (!wa_id || !text) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Body must include { wa_id, text }" });
-    }
-
-    const data = await sendWhatsAppText(wa_id, text);
-
-    // conversación
-    let convo = await airtableFindConversationByWaId(wa_id);
-
-    if (!convo) {
-      convo = await airtableCreateConversation({
-        [AIRTABLE_WA_ID_FIELD]: wa_id,
-        Nombre: "",
-        [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
-        [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: isoNow(),
-        [AIRTABLE_WA_PHONE_NUMBER_ID_FIELD]: WHATSAPP_PHONE_NUMBER_ID,
-        [AIRTABLE_WA_STATUS_FIELD]: "Mensaje enviado",
-      });
-    } else {
-      await airtableUpdateConversation(convo.id, {
-        [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
-        [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: isoNow(),
-        [AIRTABLE_WA_STATUS_FIELD]: "Mensaje enviado",
-      });
-    }
-
-    // mensaje OUT
-    const msgId = data?.messages?.[0]?.id || `out_${Date.now()}`;
-    await airtableCreateMessage({
-      [AIRTABLE_MSG_ID_FIELD]: msgId,
-      [AIRTABLE_MSG_DIRECTION_FIELD]: "OUT",
-      [AIRTABLE_MSG_WA_ID_FIELD]: wa_id,
-      [AIRTABLE_MSG_TEXT_FIELD]: text,
-      [AIRTABLE_MSG_DATE_FIELD]: isoNow(),
-      [AIRTABLE_MSG_CONVO_LINK_FIELD]: [convo.id],
-    });
-
-    // SSE
-    sseSend(wa_id, {
-      type: "message",
-      direction: "OUT",
-      message_id: msgId,
-      wa_id,
-      text,
-      date: isoNow(),
-    });
-
-    return res.status(200).json({ ok: true, data });
-  } catch (e) {
-    console.error("[PORTAL-SEND] Error:", e?.response?.data || e.message);
-    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
-  }
-});
-
-// =============================
-// Portal → cerrar conversación manualmente
-// =============================
-app.post("/portal/close", portalAuth, async (req, res) => {
-  try {
-    const { wa_id } = req.body;
-    if (!wa_id) {
-      return res.status(400).json({ ok: false, error: "Body must include { wa_id }" });
-    }
-
-    // 1) buscar conversación
-    const convo = await airtableFindConversationByWaId(wa_id);
-    if (!convo) {
-      return res.status(404).json({ ok: false, error: "Conversation not found" });
-    }
-
-    // 2) mensaje final
-    const finalText =
-      "⏳ Hemos cerrado esta conversación. Si deseas volver a hablar con nosotros, por favor reserva otra cita en Calendly o escríbenos por correo.";
-
-    // 3) enviar WhatsApp (OUT)
-    const data = await sendWhatsAppText(wa_id, finalText);
-
-    // 4) guardar mensaje OUT en Mensajes WhatsApp
-    const msgId = data?.messages?.[0]?.id || `out_close_${Date.now()}`;
-
-    await airtableCreateMessage({
-      [AIRTABLE_MSG_ID_FIELD]: msgId,
-      [AIRTABLE_MSG_DIRECTION_FIELD]: "OUT",
-      [AIRTABLE_MSG_WA_ID_FIELD]: wa_id,
-      [AIRTABLE_MSG_TEXT_FIELD]: finalText,
-      [AIRTABLE_MSG_DATE_FIELD]: isoNow(),
-      [AIRTABLE_MSG_CONVO_LINK_FIELD]: [convo.id],
-    });
-
-    // 5) marcar conversación como cerrada
-    await airtableUpdateConversation(convo.id, {
-      [AIRTABLE_WA_STATUS_FIELD]: "Cerrada",
-      [AIRTABLE_WA_LAST_MESSAGE_FIELD]: finalText,
-      [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: isoNow(),
-    });
-
-    // 6) emitir SSE (para portal)
-    sseSend(wa_id, {
-      type: "conversation_closed",
-      wa_id,
-      text: finalText,
-      date: isoNow(),
-    });
-
-    return res.status(200).json({ ok: true, closed: true });
-  } catch (e) {
-    console.error("[PORTAL-CLOSE] Error:", e?.response?.data || e.message);
-    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
-  }
-});
-
-// ===================================
 // Portal → listar conversaciones (INBOX)
 // ===================================
 app.get("/portal/conversations", portalAuth, async (req, res) => {
   try {
-    const formula = encodeURIComponent(`{${AIRTABLE_WA_STATUS_FIELD}}!="Cerrada"`);
+    const formula = encodeURIComponent(
+      `{${AIRTABLE_WA_STATUS_FIELD}}!="Cerrada"`
+    );
 
     const url = `${airtableConversationsUrl}?filterByFormula=${formula}&sort[0][field]=${encodeURIComponent(
       AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD
@@ -439,6 +328,123 @@ app.get("/portal/messages", portalAuth, async (req, res) => {
     return res.json({ ok: true, items });
   } catch (e) {
     console.error("[PORTAL-MESSAGES] Error:", e?.response?.data || e.message);
+    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
+  }
+});
+
+// ===================================
+// Portal → send message (OUT)
+// ===================================
+app.post("/portal/send", portalAuth, async (req, res) => {
+  try {
+    const { wa_id, text } = req.body;
+    if (!wa_id || !text) {
+      return res.status(400).json({ ok: false, error: "Body must include { wa_id, text }" });
+    }
+
+    // 🔒 Si está cerrada, NO dejamos enviar
+    const convo = await airtableFindConversationByWaId(wa_id);
+    if (convo && convo.fields?.[AIRTABLE_WA_STATUS_FIELD] === "Cerrada") {
+      return res.status(403).json({
+        ok: false,
+        error: "Conversation is closed. Reopen manually if needed.",
+      });
+    }
+
+    const data = await sendWhatsAppText(wa_id, text);
+
+    let finalConvo = convo;
+
+    if (!finalConvo) {
+      finalConvo = await airtableCreateConversation({
+        [AIRTABLE_WA_ID_FIELD]: wa_id,
+        Nombre: "",
+        [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
+        [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: isoNow(),
+        [AIRTABLE_WA_PHONE_NUMBER_ID_FIELD]: WHATSAPP_PHONE_NUMBER_ID,
+        [AIRTABLE_WA_STATUS_FIELD]: "Mensaje enviado",
+      });
+    } else {
+      await airtableUpdateConversation(finalConvo.id, {
+        [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
+        [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: isoNow(),
+        [AIRTABLE_WA_STATUS_FIELD]: "Mensaje enviado",
+      });
+    }
+
+    const msgId = data?.messages?.[0]?.id || `out_${Date.now()}`;
+    await airtableCreateMessage({
+      [AIRTABLE_MSG_ID_FIELD]: msgId,
+      [AIRTABLE_MSG_DIRECTION_FIELD]: "OUT",
+      [AIRTABLE_MSG_WA_ID_FIELD]: wa_id,
+      [AIRTABLE_MSG_TEXT_FIELD]: text,
+      [AIRTABLE_MSG_DATE_FIELD]: isoNow(),
+      [AIRTABLE_MSG_CONVO_LINK_FIELD]: [finalConvo.id],
+    });
+
+    sseSend(wa_id, {
+      type: "message",
+      direction: "OUT",
+      message_id: msgId,
+      wa_id,
+      text,
+      date: isoNow(),
+    });
+
+    return res.status(200).json({ ok: true, data });
+  } catch (e) {
+    console.error("[PORTAL-SEND] Error:", e?.response?.data || e.message);
+    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
+  }
+});
+
+// =============================
+// Portal → cerrar conversación manualmente
+// =============================
+app.post("/portal/close", portalAuth, async (req, res) => {
+  try {
+    const { wa_id } = req.body;
+    if (!wa_id) {
+      return res.status(400).json({ ok: false, error: "Body must include { wa_id }" });
+    }
+
+    const convo = await airtableFindConversationByWaId(wa_id);
+    if (!convo) {
+      return res.status(404).json({ ok: false, error: "Conversation not found" });
+    }
+
+    const finalText =
+      "⏳ Hemos cerrado esta conversación. Si deseas volver a hablar con nosotros, por favor reserva otra cita en Calendly o escríbenos por correo.";
+
+    const data = await sendWhatsAppText(wa_id, finalText);
+
+    const msgId = data?.messages?.[0]?.id || `out_close_${Date.now()}`;
+
+    await airtableCreateMessage({
+      [AIRTABLE_MSG_ID_FIELD]: msgId,
+      [AIRTABLE_MSG_DIRECTION_FIELD]: "OUT",
+      [AIRTABLE_MSG_WA_ID_FIELD]: wa_id,
+      [AIRTABLE_MSG_TEXT_FIELD]: finalText,
+      [AIRTABLE_MSG_DATE_FIELD]: isoNow(),
+      [AIRTABLE_MSG_CONVO_LINK_FIELD]: [convo.id],
+    });
+
+    await airtableUpdateConversation(convo.id, {
+      [AIRTABLE_WA_STATUS_FIELD]: "Cerrada",
+      [AIRTABLE_WA_LAST_MESSAGE_FIELD]: finalText,
+      [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: isoNow(),
+    });
+
+    sseSend(wa_id, {
+      type: "conversation_closed",
+      wa_id,
+      text: finalText,
+      date: isoNow(),
+    });
+
+    return res.status(200).json({ ok: true, closed: true });
+  } catch (e) {
+    console.error("[PORTAL-CLOSE] Error:", e?.response?.data || e.message);
     return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
   }
 });
@@ -490,7 +496,65 @@ app.post("/webhooks/whatsapp", async (req, res) => {
 
         log("[WA] Incoming message:", { waId, contactName, text });
 
-        // Buscar cita por teléfono
+        // 1) Buscar conversación existente
+        let convo = await airtableFindConversationByWaId(waId);
+
+        // ===================================
+        // ✅ BLOQUEO DE REAPERTURA SI ESTÁ CERRADA
+        // ===================================
+        if (convo && convo.fields?.[AIRTABLE_WA_STATUS_FIELD] === "Cerrada") {
+          console.log("[WA] ❌ Mensaje recibido en conversación cerrada:", waId);
+
+          // guardar IN
+          const inMsgId = msg.id || `in_${Date.now()}`;
+          await airtableCreateMessage({
+            [AIRTABLE_MSG_ID_FIELD]: inMsgId,
+            [AIRTABLE_MSG_DIRECTION_FIELD]: "IN",
+            [AIRTABLE_MSG_WA_ID_FIELD]: waId,
+            [AIRTABLE_MSG_TEXT_FIELD]: text,
+            [AIRTABLE_MSG_DATE_FIELD]: timestampIso,
+            [AIRTABLE_MSG_CONVO_LINK_FIELD]: [convo.id],
+          });
+
+          // responder auto
+          const data = await sendWhatsAppText(waId, CLOSED_AUTO_REPLY);
+          const outMsgId = data?.messages?.[0]?.id || `out_closed_${Date.now()}`;
+
+          // guardar OUT auto
+          await airtableCreateMessage({
+            [AIRTABLE_MSG_ID_FIELD]: outMsgId,
+            [AIRTABLE_MSG_DIRECTION_FIELD]: "OUT",
+            [AIRTABLE_MSG_WA_ID_FIELD]: waId,
+            [AIRTABLE_MSG_TEXT_FIELD]: CLOSED_AUTO_REPLY,
+            [AIRTABLE_MSG_DATE_FIELD]: isoNow(),
+            [AIRTABLE_MSG_CONVO_LINK_FIELD]: [convo.id],
+          });
+
+          // SSE portal (para que lo veas en directo si estabas mirando)
+          sseSend(waId, {
+            type: "message",
+            direction: "IN",
+            message_id: inMsgId,
+            wa_id: waId,
+            name: contactName,
+            text,
+            date: timestampIso,
+          });
+
+          sseSend(waId, {
+            type: "message",
+            direction: "OUT",
+            message_id: outMsgId,
+            wa_id: waId,
+            text: CLOSED_AUTO_REPLY,
+            date: isoNow(),
+          });
+
+          // ✅ NO UPSERT. No se reabre.
+          continue;
+        }
+
+        // 2) Buscar cita por teléfono
         const phoneE164 = toE164FromWaId(waId);
         const appointment = await airtableFindAppointmentByPhone(phoneE164);
 
@@ -507,16 +571,14 @@ app.post("/webhooks/whatsapp", async (req, res) => {
 
         if (appointment) convoFields[AIRTABLE_WA_LINK_FIELD] = [appointment.id];
 
-        let convo = await airtableFindConversationByWaId(waId);
+        // 3) Upsert conversación
         if (convo) {
           convo = await airtableUpdateConversation(convo.id, convoFields);
-          log("[WA] ✅ Updated conversation:", waId);
         } else {
           convo = await airtableCreateConversation(convoFields);
-          log("[WA] ✅ Created conversation:", waId);
         }
 
-        // Guardar mensaje IN
+        // 4) Guardar mensaje IN
         const msgId = msg.id || `in_${Date.now()}`;
         await airtableCreateMessage({
           [AIRTABLE_MSG_ID_FIELD]: msgId,
@@ -527,9 +589,7 @@ app.post("/webhooks/whatsapp", async (req, res) => {
           [AIRTABLE_MSG_CONVO_LINK_FIELD]: [convo.id],
         });
 
-        log("[WA] ✅ Saved message:", msgId);
-
-        // SSE
+        // 5) SSE portal
         sseSend(waId, {
           type: "message",
           direction: "IN",
