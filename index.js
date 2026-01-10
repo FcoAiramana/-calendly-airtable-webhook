@@ -32,7 +32,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Render necesita process.env.PORT
 const PORT = process.env.PORT || 3000;
 
 // ===================================
@@ -80,6 +79,32 @@ const {
 } = process.env;
 
 // ===================================
+// ✅ GUARD CLAUSE (NO ARRANCA SI FALTA ALGO CRÍTICO)
+// ===================================
+function assertEnv() {
+  const required = [
+    "AIRTABLE_TOKEN",
+    "AIRTABLE_BASE_ID",
+    "AIRTABLE_TABLE_NAME",
+    "WHATSAPP_ACCESS_TOKEN",
+    "WHATSAPP_PHONE_NUMBER_ID",
+    "WHATSAPP_VERIFY_TOKEN",
+    "PORTAL_API_KEY",
+  ];
+
+  const missing = required.filter((k) => !process.env[k] || String(process.env[k]).trim() === "");
+  if (missing.length) {
+    console.error("\n❌ [BOOT] Missing required ENV vars:", missing.join(", "));
+    console.error("➡️  Fix your .env / Render env settings and redeploy.\n");
+    process.exit(1);
+  }
+
+  console.log("✅ [BOOT] ENV OK — starting server");
+}
+
+assertEnv();
+
+// ===================================
 // Basic routes
 // ===================================
 app.get("/", (req, res) =>
@@ -98,8 +123,19 @@ function isoNow() {
   return new Date().toISOString();
 }
 
-function log(...args) {
+function logInfo(...args) {
   if (LOG_LEVEL === "debug" || LOG_LEVEL === "info") console.log(...args);
+}
+
+function logDebug(...args) {
+  if (LOG_LEVEL === "debug") console.log(...args);
+}
+
+function logError(tag, e, extra = {}) {
+  console.error(tag, {
+    ...extra,
+    error: e?.response?.data || e?.message || String(e),
+  });
 }
 
 function toE164FromWaId(waId) {
@@ -141,7 +177,6 @@ async function airtableFindAppointmentByPhone(phoneE164) {
 // ✅ Listar próximas citas desde Airtable (Fecha >= ahora)
 async function airtableListUpcomingAppointments(limit = 50) {
   const DATE_FIELD = "Fecha"; // ✅ confirmado
-
   const now = new Date().toISOString();
   const formula = encodeURIComponent(`{${DATE_FIELD}}>="${now}"`);
 
@@ -236,7 +271,6 @@ app.get("/sse", (req, res) => {
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
-
   res.flushHeaders?.();
 
   if (!sseClientsByWaId.has(waId)) sseClientsByWaId.set(waId, new Set());
@@ -259,10 +293,6 @@ app.get("/sse", (req, res) => {
 // WhatsApp Cloud API send helper
 // ===================================
 async function sendWhatsAppText(toWaIdOrPhone, text) {
-  if (!WHATSAPP_ACCESS_TOKEN || !WHATSAPP_PHONE_NUMBER_ID) {
-    throw new Error("Missing WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID");
-  }
-
   const toClean = String(toWaIdOrPhone).replace(/\s/g, "");
   const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
 
@@ -287,10 +317,6 @@ async function sendWhatsAppText(toWaIdOrPhone, text) {
 // Seguridad portal (API key)
 // ===================================
 function portalAuth(req, res, next) {
-  if (!PORTAL_API_KEY) {
-    console.log("[SECURITY] ⚠️ Missing PORTAL_API_KEY in env");
-    return res.status(500).json({ ok: false, error: "Server misconfigured" });
-  }
   const key = req.headers["x-api-key"];
   if (!key || key !== PORTAL_API_KEY) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
@@ -312,7 +338,6 @@ async function syncAppointmentsToConversations(limit = 50) {
     const waId = String(phoneE164).replace("+", "").trim();
     if (!waId) continue;
 
-    // Si ya existe conversación, no duplicamos
     const existing = await airtableFindConversationByWaId(waId);
     if (existing) continue;
 
@@ -327,29 +352,32 @@ async function syncAppointmentsToConversations(limit = 50) {
     });
 
     created++;
-    console.log("[SYNC] ✅ Created scheduled convo:", waId);
+    logInfo("[SYNC] ✅ Created scheduled convo:", waId);
   }
+
+  if (created > 0) logInfo("[SYNC] ✅ Done. created:", created, "total:", appointments.length);
+  else logDebug("[SYNC] No new scheduled convos. total:", appointments.length);
 
   return { created, total: appointments.length };
 }
 
-// Endpoint manual (por si quieres forzarlo)
+// Endpoint manual
 app.post("/sync/appointments", portalAuth, async (req, res) => {
   try {
     const result = await syncAppointmentsToConversations(50);
     return res.json({ ok: true, ...result });
   } catch (e) {
-    console.error("[SYNC-APPOINTMENTS] Error:", e?.response?.data || e.message);
+    logError("[SYNC-APPOINTMENTS] ❌ Error", e);
     return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
   }
 });
 
-// Ejecuta sync cada 10 minutos automáticamente
+// Auto sync cada 10 minutos
 setInterval(async () => {
   try {
     await syncAppointmentsToConversations(50);
   } catch (e) {
-    console.error("[SYNC] ❌ Error:", e?.response?.data || e.message);
+    logError("[SYNC] ❌ Error", e);
   }
 }, 10 * 60 * 1000);
 
@@ -377,34 +405,7 @@ app.get("/portal/conversations", portalAuth, async (req, res) => {
 
     return res.json({ ok: true, items });
   } catch (e) {
-    console.error("[PORTAL-CONVERSATIONS] Error:", e?.response?.data || e.message);
-    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
-  }
-});
-
-// ===================================
-// Portal → listar TODAS las conversaciones (incluye cerradas)
-// ===================================
-app.get("/portal/conversations/all", portalAuth, async (req, res) => {
-  try {
-    const url = `${airtableConversationsUrl}?sort[0][field]=${encodeURIComponent(
-      AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD
-    )}&sort[0][direction]=desc&pageSize=100`;
-
-    const r = await axios.get(url, { headers: airtableHeaders() });
-
-    const items = (r.data.records || []).map((rec) => ({
-      id: rec.id,
-      wa_id: rec.fields?.[AIRTABLE_WA_ID_FIELD],
-      nombre: rec.fields?.["Nombre"] || "",
-      ultimo: rec.fields?.[AIRTABLE_WA_LAST_MESSAGE_FIELD] || "",
-      fecha: rec.fields?.[AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD] || "",
-      estado: rec.fields?.[AIRTABLE_WA_STATUS_FIELD] || "",
-    }));
-
-    return res.json({ ok: true, items });
-  } catch (e) {
-    console.error("[PORTAL-CONVERSATIONS-ALL] Error:", e?.response?.data || e.message);
+    logError("[PORTAL-CONVERSATIONS] ❌ Error", e);
     return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
   }
 });
@@ -429,7 +430,7 @@ app.get("/portal/messages", portalAuth, async (req, res) => {
 
     return res.json({ ok: true, items });
   } catch (e) {
-    console.error("[PORTAL-MESSAGES] Error:", e?.response?.data || e.message);
+    logError("[PORTAL-MESSAGES] ❌ Error", e);
     return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
   }
 });
@@ -444,9 +445,11 @@ app.post("/portal/send", portalAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "Body must include { wa_id, text }" });
     }
 
-    // 🔒 Si está cerrada, NO dejamos enviar
     const convo = await airtableFindConversationByWaId(wa_id);
+
+    // 🔒 Si está cerrada, NO dejamos enviar
     if (convo && convo.fields?.[AIRTABLE_WA_STATUS_FIELD] === "Cerrada") {
+      logInfo("[PORTAL-SEND] ❌ Attempt send to CLOSED convo:", wa_id);
       return res.status(403).json({
         ok: false,
         error: "Conversation is closed. Reopen manually if needed.",
@@ -457,7 +460,6 @@ app.post("/portal/send", portalAuth, async (req, res) => {
 
     let finalConvo = convo;
 
-    // ✅ IMPORTANTE: si el portal envía un mensaje → la conversación es Activa
     if (!finalConvo) {
       finalConvo = await airtableCreateConversation({
         [AIRTABLE_WA_ID_FIELD]: wa_id,
@@ -494,9 +496,11 @@ app.post("/portal/send", portalAuth, async (req, res) => {
       date: isoNow(),
     });
 
+    logInfo("[PORTAL-SEND] ✅ OUT sent:", { wa_id, msgId });
+
     return res.status(200).json({ ok: true, data });
   } catch (e) {
-    console.error("[PORTAL-SEND] Error:", e?.response?.data || e.message);
+    logError("[PORTAL-SEND] ❌ Error", e);
     return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
   }
 });
@@ -544,9 +548,11 @@ app.post("/portal/close", portalAuth, async (req, res) => {
       date: isoNow(),
     });
 
+    logInfo("[PORTAL-CLOSE] ✅ Closed convo:", wa_id);
+
     return res.status(200).json({ ok: true, closed: true });
   } catch (e) {
-    console.error("[PORTAL-CLOSE] Error:", e?.response?.data || e.message);
+    logError("[PORTAL-CLOSE] ❌ Error", e);
     return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
   }
 });
@@ -576,7 +582,7 @@ app.post("/webhooks/whatsapp", async (req, res) => {
 
   try {
     const body = req.body;
-    log("[WA-WEBHOOK] BODY ✅", JSON.stringify(body).slice(0, 800));
+    logDebug("[WA-WEBHOOK] BODY ✅", JSON.stringify(body).slice(0, 800));
     if (!body?.entry?.length) return;
 
     for (const entry of body.entry) {
@@ -596,8 +602,7 @@ app.post("/webhooks/whatsapp", async (req, res) => {
         const phoneNumberId = value?.metadata?.phone_number_id || null;
         const contactName = contacts?.[0]?.profile?.name || "";
 
-        // ✅ FIX CRÍTICO: aquí sí existe phoneE164
-        const phoneE164 = toE164FromWaId(waId);
+        logInfo("[WA] Incoming:", { waId, contactName, text });
 
         // 1) Buscar conversación existente
         let convo = await airtableFindConversationByWaId(waId);
@@ -606,9 +611,8 @@ app.post("/webhooks/whatsapp", async (req, res) => {
         // ✅ BLOQUEO DE REAPERTURA SI ESTÁ CERRADA
         // ===================================
         if (convo && convo.fields?.[AIRTABLE_WA_STATUS_FIELD] === "Cerrada") {
-          console.log("[WA] ❌ Mensaje recibido en conversación cerrada:", waId);
+          logInfo("[WA] 🔒 BLOCKED reopen (CLOSED):", waId);
 
-          // guardar IN
           const inMsgId = msg.id || `in_${Date.now()}`;
           await airtableCreateMessage({
             [AIRTABLE_MSG_ID_FIELD]: inMsgId,
@@ -619,11 +623,9 @@ app.post("/webhooks/whatsapp", async (req, res) => {
             [AIRTABLE_MSG_CONVO_LINK_FIELD]: [convo.id],
           });
 
-          // responder auto
           const data = await sendWhatsAppText(waId, CLOSED_AUTO_REPLY);
           const outMsgId = data?.messages?.[0]?.id || `out_closed_${Date.now()}`;
 
-          // guardar OUT auto
           await airtableCreateMessage({
             [AIRTABLE_MSG_ID_FIELD]: outMsgId,
             [AIRTABLE_MSG_DIRECTION_FIELD]: "OUT",
@@ -633,7 +635,6 @@ app.post("/webhooks/whatsapp", async (req, res) => {
             [AIRTABLE_MSG_CONVO_LINK_FIELD]: [convo.id],
           });
 
-          // SSE portal
           sseSend(waId, {
             type: "message",
             direction: "IN",
@@ -653,11 +654,11 @@ app.post("/webhooks/whatsapp", async (req, res) => {
             date: isoNow(),
           });
 
-          // ✅ NO UPSERT. No se reabre.
           continue;
         }
 
         // 2) Buscar cita por teléfono
+        const phoneE164 = toE164FromWaId(waId);
         const appointment = await airtableFindAppointmentByPhone(phoneE164);
 
         // ✅ si ya hay mensajes, NO puede ser Programada
@@ -706,10 +707,12 @@ app.post("/webhooks/whatsapp", async (req, res) => {
           text,
           date: timestampIso,
         });
+
+        logInfo("[WA] ✅ Saved IN:", { waId, msgId, status });
       }
     }
   } catch (e) {
-    console.error("[WA-WEBHOOK] ❌ Error:", e?.response?.data || e.message);
+    logError("[WA-WEBHOOK] ❌ Error", e);
   }
 });
 
