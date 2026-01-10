@@ -332,6 +332,63 @@ app.post("/portal/send", portalAuth, async (req, res) => {
   }
 });
 
+// =============================
+// Portal → cerrar conversación manualmente
+// =============================
+app.post("/portal/close", portalAuth, async (req, res) => {
+  try {
+    const { wa_id } = req.body;
+    if (!wa_id) {
+      return res.status(400).json({ ok: false, error: "Body must include { wa_id }" });
+    }
+
+    // 1) buscar conversación
+    const convo = await airtableFindConversationByWaId(wa_id);
+    if (!convo) {
+      return res.status(404).json({ ok: false, error: "Conversation not found" });
+    }
+
+    // 2) mensaje final
+    const finalText =
+      "⏳ Hemos cerrado esta conversación. Si deseas volver a hablar con nosotros, por favor reserva otra cita en Calendly o escríbenos por correo.";
+
+    // 3) enviar WhatsApp (OUT)
+    const data = await sendWhatsAppText(wa_id, finalText);
+
+    // 4) guardar mensaje OUT en Mensajes WhatsApp
+    const msgId = data?.messages?.[0]?.id || `out_close_${Date.now()}`;
+
+    await airtableCreateMessage({
+      [AIRTABLE_MSG_ID_FIELD]: msgId,
+      [AIRTABLE_MSG_DIRECTION_FIELD]: "OUT",
+      [AIRTABLE_MSG_WA_ID_FIELD]: wa_id,
+      [AIRTABLE_MSG_TEXT_FIELD]: finalText,
+      [AIRTABLE_MSG_DATE_FIELD]: isoNow(),
+      [AIRTABLE_MSG_CONVO_LINK_FIELD]: [convo.id],
+    });
+
+    // 5) marcar conversación como cerrada
+    await airtableUpdateConversation(convo.id, {
+      [AIRTABLE_WA_STATUS_FIELD]: "Cerrada",
+      [AIRTABLE_WA_LAST_MESSAGE_FIELD]: finalText,
+      [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: isoNow(),
+    });
+
+    // 6) emitir SSE (para portal)
+    sseSend(wa_id, {
+      type: "conversation_closed",
+      wa_id,
+      text: finalText,
+      date: isoNow(),
+    });
+
+    return res.status(200).json({ ok: true, closed: true });
+  } catch (e) {
+    console.error("[PORTAL-CLOSE] Error:", e?.response?.data || e.message);
+    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
+  }
+});
+
 // ===================================
 // Portal → listar conversaciones (INBOX)
 // ===================================
