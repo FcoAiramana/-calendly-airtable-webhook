@@ -8,12 +8,28 @@ app.use(express.json({ limit: "1mb" }));
 // ===================================
 // ✅ CORS (necesario para Portal + SSE)
 // ===================================
-app.use((req, res, next) => {
-  const allowedOrigin = process.env.PORTAL_ALLOWED_ORIGIN || "*";
+// ✅ CORS dinámico: permite localhost + vercel + otros que añadas
+const ALLOWED_ORIGINS = [
+  "http://localhost:3000",
+  "https://ace-project-7vyqhwex2-pacos-projects-47780fd7.vercel.app",
+];
 
-  res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  // Si viene origin y está en whitelist => lo devolvemos
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else {
+    // fallback (opcional) para curl/postman
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+
+  // ✅ Preflight responde aquí siempre
   if (req.method === "OPTIONS") return res.sendStatus(200);
 
   next();
