@@ -375,6 +375,33 @@ app.get("/portal/conversations", portalAuth, async (req, res) => {
 });
 
 // ===================================
+// Portal → listar TODAS las conversaciones (incluye cerradas)
+// ===================================
+app.get("/portal/conversations/all", portalAuth, async (req, res) => {
+  try {
+    const url = `${airtableConversationsUrl}?sort[0][field]=${encodeURIComponent(
+      AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD
+    )}&sort[0][direction]=desc&pageSize=100`;
+
+    const r = await axios.get(url, { headers: airtableHeaders() });
+
+    const items = (r.data.records || []).map((rec) => ({
+      id: rec.id,
+      wa_id: rec.fields?.[AIRTABLE_WA_ID_FIELD],
+      nombre: rec.fields?.["Nombre"] || "",
+      ultimo: rec.fields?.[AIRTABLE_WA_LAST_MESSAGE_FIELD] || "",
+      fecha: rec.fields?.[AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD] || "",
+      estado: rec.fields?.[AIRTABLE_WA_STATUS_FIELD] || "",
+    }));
+
+    return res.json({ ok: true, items });
+  } catch (e) {
+    console.error("[PORTAL-CONVERSATIONS-ALL] Error:", e?.response?.data || e.message);
+    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
+  }
+});
+
+// ===================================
 // Portal → historial de mensajes (chat)
 // ===================================
 app.get("/portal/messages", portalAuth, async (req, res) => {
