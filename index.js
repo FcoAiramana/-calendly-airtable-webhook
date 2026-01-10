@@ -5,20 +5,28 @@ const axios = require("axios");
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ✅ CORS (necesario para SSE + Portal en Vercel)
+// ===================================
+// ✅ CORS (necesario para Portal + SSE)
+// ===================================
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  const allowedOrigin = process.env.PORTAL_ALLOWED_ORIGIN || "*";
+
+  res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(200);
+
   next();
 });
 
+// Render necesita process.env.PORT
 const PORT = process.env.PORT || 3000;
 
-// ===== ENV =====
+// ===================================
+// ENV
+// ===================================
 const {
-  // Airtable (token/base)
+  // Airtable
   AIRTABLE_TOKEN,
   AIRTABLE_BASE_ID,
 
@@ -52,41 +60,39 @@ const {
 
   // Seguridad portal
   PORTAL_API_KEY,
-  PORTAL_ALLOWED_ORIGIN,
 
   TZ = "Europe/Madrid",
   LOG_LEVEL = "info",
   NODE_ENV = "development",
 } = process.env;
 
-// =============================
+// ===================================
 // Basic routes
-// =============================
+// ===================================
 app.get("/", (req, res) =>
   res.status(200).send("ACE backend: WhatsApp webhook + Airtable + SSE running")
 );
 app.get("/health", (req, res) => res.status(200).send("OK"));
 
-// =============================
+// ===================================
 // Helpers
-// =============================
+// ===================================
 function isoNow() {
   return new Date().toISOString();
 }
+
 function log(...args) {
   if (LOG_LEVEL === "debug" || LOG_LEVEL === "info") console.log(...args);
 }
-function logDebug(...args) {
-  if (LOG_LEVEL === "debug") console.log(...args);
-}
+
 function toE164FromWaId(waId) {
   if (!waId) return null;
   return waId.startsWith("+") ? waId : `+${waId}`;
 }
 
-// =============================
+// ===================================
 // Airtable helpers
-// =============================
+// ===================================
 function airtableHeaders() {
   return {
     Authorization: `Bearer ${AIRTABLE_TOKEN}`,
@@ -141,7 +147,7 @@ async function airtableUpdateConversation(recordId, fields) {
   return res.data.records?.[0];
 }
 
-// ---- Mensajes: crear siempre (histórico) ----
+// ---- Mensajes: crear siempre ----
 async function airtableCreateMessage(fields) {
   const res = await axios.post(
     airtableMessagesUrl,
@@ -151,9 +157,19 @@ async function airtableCreateMessage(fields) {
   return res.data.records?.[0];
 }
 
-// =============================
-// SSE: Tiempo real para Portal
-// =============================
+// ✅ Listar mensajes por wa_id (CORRECTO)
+async function airtableListMessagesByWaId(waId, limit = 200) {
+  const formula = encodeURIComponent(`{${AIRTABLE_MSG_WA_ID_FIELD}}="${waId}"`);
+  const sort = `sort[0][field]=${encodeURIComponent(AIRTABLE_MSG_DATE_FIELD)}&sort[0][direction]=asc`;
+  const url = `${airtableMessagesUrl}?filterByFormula=${formula}&pageSize=${limit}&${sort}`;
+
+  const res = await axios.get(url, { headers: airtableHeaders() });
+  return res.data.records || [];
+}
+
+// ===================================
+// SSE (tiempo real)
+// ===================================
 const sseClientsByWaId = new Map(); // wa_id -> Set(res)
 
 function sseSend(waId, event) {
@@ -164,7 +180,7 @@ function sseSend(waId, event) {
   for (const res of clients) {
     try {
       res.write(payload);
-    } catch (e) {}
+    } catch {}
   }
 }
 
@@ -177,16 +193,14 @@ app.get("/sse", (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
 
-  if (PORTAL_ALLOWED_ORIGIN) {
-    res.setHeader("Access-Control-Allow-Origin", PORTAL_ALLOWED_ORIGIN);
-  }
-
   res.flushHeaders?.();
 
   if (!sseClientsByWaId.has(waId)) sseClientsByWaId.set(waId, new Set());
   sseClientsByWaId.get(waId).add(res);
 
-  res.write(`data: ${JSON.stringify({ type: "connected", waId, ts: isoNow() })}\n\n`);
+  res.write(
+    `data: ${JSON.stringify({ type: "connected", waId, ts: isoNow() })}\n\n`
+  );
 
   req.on("close", () => {
     const set = sseClientsByWaId.get(waId);
@@ -197,9 +211,9 @@ app.get("/sse", (req, res) => {
   });
 });
 
-// =============================
+// ===================================
 // WhatsApp Cloud API send helper
-// =============================
+// ===================================
 async function sendWhatsAppText(toWaIdOrPhone, text) {
   if (!WHATSAPP_ACCESS_TOKEN || !WHATSAPP_PHONE_NUMBER_ID) {
     throw new Error("Missing WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID");
@@ -225,15 +239,14 @@ async function sendWhatsAppText(toWaIdOrPhone, text) {
   return resp.data;
 }
 
-// =============================
+// ===================================
 // Seguridad portal (API key)
-// =============================
+// ===================================
 function portalAuth(req, res, next) {
   if (!PORTAL_API_KEY) {
     console.log("[SECURITY] ⚠️ Missing PORTAL_API_KEY in env");
     return res.status(500).json({ ok: false, error: "Server misconfigured" });
   }
-
   const key = req.headers["x-api-key"];
   if (!key || key !== PORTAL_API_KEY) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
@@ -241,24 +254,27 @@ function portalAuth(req, res, next) {
   next();
 }
 
-// =============================
-// Portal → send message (humano)
-// =============================
+// ===================================
+// Portal → send message (OUT)
+// ===================================
 app.post("/portal/send", portalAuth, async (req, res) => {
   try {
     const { wa_id, text } = req.body;
     if (!wa_id || !text) {
-      return res.status(400).json({ ok: false, error: "Body must include { wa_id, text }" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Body must include { wa_id, text }" });
     }
 
     const data = await sendWhatsAppText(wa_id, text);
 
     // conversación
     let convo = await airtableFindConversationByWaId(wa_id);
+
     if (!convo) {
       convo = await airtableCreateConversation({
         [AIRTABLE_WA_ID_FIELD]: wa_id,
-        "Nombre": "",
+        Nombre: "",
         [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
         [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: isoNow(),
         [AIRTABLE_WA_PHONE_NUMBER_ID_FIELD]: WHATSAPP_PHONE_NUMBER_ID,
@@ -274,7 +290,6 @@ app.post("/portal/send", portalAuth, async (req, res) => {
 
     // mensaje OUT
     const msgId = data?.messages?.[0]?.id || `out_${Date.now()}`;
-
     await airtableCreateMessage({
       [AIRTABLE_MSG_ID_FIELD]: msgId,
       [AIRTABLE_MSG_DIRECTION_FIELD]: "OUT",
@@ -301,14 +316,12 @@ app.post("/portal/send", portalAuth, async (req, res) => {
   }
 });
 
-// =============================
-// Portal → listar conversaciones abiertas
-// =============================
-app.get("/portal/conversations", async (req, res) => {
+// ===================================
+// Portal → listar conversaciones (INBOX)
+// ===================================
+app.get("/portal/conversations", portalAuth, async (req, res) => {
   try {
-    const formula = encodeURIComponent(
-      `{${AIRTABLE_WA_STATUS_FIELD}}!="Cerrada"`
-    );
+    const formula = encodeURIComponent(`{${AIRTABLE_WA_STATUS_FIELD}}!="Cerrada"`);
 
     const url = `${airtableConversationsUrl}?filterByFormula=${formula}&sort[0][field]=${encodeURIComponent(
       AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD
@@ -325,16 +338,41 @@ app.get("/portal/conversations", async (req, res) => {
       estado: rec.fields?.[AIRTABLE_WA_STATUS_FIELD] || "",
     }));
 
-    res.json({ ok: true, items });
+    return res.json({ ok: true, items });
   } catch (e) {
     console.error("[PORTAL-CONVERSATIONS] Error:", e?.response?.data || e.message);
-    res.status(500).json({ ok: false, error: e?.response?.data || e.message });
+    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
   }
 });
 
-// =============================
+// ===================================
+// Portal → historial de mensajes (chat)
+// ===================================
+app.get("/portal/messages", portalAuth, async (req, res) => {
+  try {
+    const waId = String(req.query.wa_id || "").trim();
+    if (!waId) return res.status(400).json({ ok: false, error: "Missing wa_id" });
+
+    const records = await airtableListMessagesByWaId(waId, 200);
+
+    const items = records.map((rec) => ({
+      message_id: rec.fields?.[AIRTABLE_MSG_ID_FIELD] || rec.id,
+      direction: rec.fields?.[AIRTABLE_MSG_DIRECTION_FIELD] || "IN",
+      wa_id: rec.fields?.[AIRTABLE_MSG_WA_ID_FIELD] || waId,
+      text: rec.fields?.[AIRTABLE_MSG_TEXT_FIELD] || "",
+      date: rec.fields?.[AIRTABLE_MSG_DATE_FIELD] || "",
+    }));
+
+    return res.json({ ok: true, items });
+  } catch (e) {
+    console.error("[PORTAL-MESSAGES] Error:", e?.response?.data || e.message);
+    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
+  }
+});
+
+// ===================================
 // WhatsApp Webhook Verification
-// =============================
+// ===================================
 app.get("/webhooks/whatsapp", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -349,15 +387,15 @@ app.get("/webhooks/whatsapp", (req, res) => {
   return res.sendStatus(403);
 });
 
-// =============================
+// ===================================
 // WhatsApp Webhook (IN) → Airtable + SSE
-// =============================
+// ===================================
 app.post("/webhooks/whatsapp", async (req, res) => {
   res.sendStatus(200);
 
   try {
     const body = req.body;
-    console.log("[WA-WEBHOOK] BODY ✅", JSON.stringify(body).slice(0, 800));
+    log("[WA-WEBHOOK] BODY ✅", JSON.stringify(body).slice(0, 800));
     if (!body?.entry?.length) return;
 
     for (const entry of body.entry) {
@@ -377,39 +415,36 @@ app.post("/webhooks/whatsapp", async (req, res) => {
         const phoneNumberId = value?.metadata?.phone_number_id || null;
         const contactName = contacts?.[0]?.profile?.name || "";
 
-        console.log("[WA] Incoming message:", { waId, contactName, text });
+        log("[WA] Incoming message:", { waId, contactName, text });
 
+        // Buscar cita por teléfono
         const phoneE164 = toE164FromWaId(waId);
         const appointment = await airtableFindAppointmentByPhone(phoneE164);
 
-        // estado según cita
         const status = appointment ? "Programada" : "Mensaje enviado";
 
         const convoFields = {
           [AIRTABLE_WA_ID_FIELD]: waId,
-          "Nombre": contactName,
+          Nombre: contactName,
           [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
           [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: timestampIso,
           [AIRTABLE_WA_PHONE_NUMBER_ID_FIELD]: phoneNumberId,
           [AIRTABLE_WA_STATUS_FIELD]: status,
         };
 
-        if (appointment) {
-          convoFields[AIRTABLE_WA_LINK_FIELD] = [appointment.id];
-        }
+        if (appointment) convoFields[AIRTABLE_WA_LINK_FIELD] = [appointment.id];
 
         let convo = await airtableFindConversationByWaId(waId);
         if (convo) {
           convo = await airtableUpdateConversation(convo.id, convoFields);
-          console.log("[WA] ✅ Updated conversation:", waId);
+          log("[WA] ✅ Updated conversation:", waId);
         } else {
           convo = await airtableCreateConversation(convoFields);
-          console.log("[WA] ✅ Created conversation:", waId);
+          log("[WA] ✅ Created conversation:", waId);
         }
 
-        // guardar mensaje IN
+        // Guardar mensaje IN
         const msgId = msg.id || `in_${Date.now()}`;
-
         await airtableCreateMessage({
           [AIRTABLE_MSG_ID_FIELD]: msgId,
           [AIRTABLE_MSG_DIRECTION_FIELD]: "IN",
@@ -419,7 +454,7 @@ app.post("/webhooks/whatsapp", async (req, res) => {
           [AIRTABLE_MSG_CONVO_LINK_FIELD]: [convo.id],
         });
 
-        console.log("[WA] ✅ Saved message:", msgId);
+        log("[WA] ✅ Saved message:", msgId);
 
         // SSE
         sseSend(waId, {
@@ -438,15 +473,17 @@ app.post("/webhooks/whatsapp", async (req, res) => {
   }
 });
 
-// =============================
-// Auto-close (24h desde último mensaje)
-// =============================
+// ===================================
+// Auto-close conversaciones (24h)
+// ===================================
 const AUTO_CLOSE_CHECK_MINUTES = 15;
 const AUTO_CLOSE_AFTER_HOURS = 24;
 
 async function autoCloseConversations() {
   try {
-    const cutoff = new Date(Date.now() - AUTO_CLOSE_AFTER_HOURS * 60 * 60 * 1000).toISOString();
+    const cutoff = new Date(
+      Date.now() - AUTO_CLOSE_AFTER_HOURS * 60 * 60 * 1000
+    ).toISOString();
 
     const formula = encodeURIComponent(
       `AND({${AIRTABLE_WA_STATUS_FIELD}}!="Cerrada",{${AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD}}<"${cutoff}")`
@@ -504,63 +541,9 @@ async function autoCloseConversations() {
 
 setInterval(autoCloseConversations, AUTO_CLOSE_CHECK_MINUTES * 60 * 1000);
 
-// =============================
-// WhatsApp test sender
-// =============================
-app.post("/whatsapp/send-test", async (req, res) => {
-  try {
-    const { to, text } = req.body;
-    if (!to || !text) return res.status(400).json({ ok: false, error: "Body must include { to, text }" });
-
-    const data = await sendWhatsAppText(to, text);
-    return res.status(200).json({ ok: true, data });
-  } catch (e) {
-    console.error("[WA-SEND] Error:", e?.response?.data || e.message);
-    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
-  }
-});
-// =============================
-// Portal → get messages (chat history)
-// =============================
-app.get("/portal/messages", async (req, res) => {
-  try {
-    const waId = String(req.query.wa_id || "").trim();
-    if (!waId) return res.status(400).json({ ok: false, error: "Missing wa_id" });
-
-    // 1) buscar conversación
-    const convo = await airtableFindConversationByWaId(waId);
-    if (!convo) return res.status(200).json({ ok: true, items: [] });
-
-    const convoId = convo.id;
-
-    // 2) buscar mensajes vinculados a esta conversación
-    const formula = encodeURIComponent(`{${AIRTABLE_MSG_CONVO_LINK_FIELD}}="${convoId}"`);
-    const url = `${airtableMessagesUrl}?filterByFormula=${formula}&sort[0][field]=${encodeURIComponent(
-      AIRTABLE_MSG_DATE_FIELD
-    )}&sort[0][direction]=asc&pageSize=100`;
-
-    const r = await axios.get(url, { headers: airtableHeaders() });
-
-    const items =
-      (r.data.records || []).map((rec) => ({
-        message_id: rec.fields?.[AIRTABLE_MSG_ID_FIELD] || rec.id,
-        direction: rec.fields?.[AIRTABLE_MSG_DIRECTION_FIELD] || "IN",
-        wa_id: rec.fields?.[AIRTABLE_MSG_WA_ID_FIELD] || waId,
-        text: rec.fields?.[AIRTABLE_MSG_TEXT_FIELD] || "",
-        date: rec.fields?.[AIRTABLE_MSG_DATE_FIELD] || "",
-        convo_id: convoId,
-      })) || [];
-
-    return res.status(200).json({ ok: true, items });
-  } catch (e) {
-    console.error("[PORTAL-MESSAGES] Error:", e?.response?.data || e.message);
-    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
-  }
-});
-
-// =============================
+// ===================================
 // LISTEN
-// =============================
+// ===================================
 app.listen(PORT, () => {
   console.log("Server running on port", PORT, "TZ=", TZ, "NODE_ENV=", NODE_ENV);
 });
