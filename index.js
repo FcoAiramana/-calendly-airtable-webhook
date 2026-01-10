@@ -32,6 +32,7 @@ app.use((req, res, next) => {
   next();
 });
 
+// Render necesita process.env.PORT
 const PORT = process.env.PORT || 3000;
 
 // ===================================
@@ -202,6 +203,14 @@ async function airtableListMessagesByWaId(waId, limit = 100) {
   return (res.data.records || []).slice(0, limit);
 }
 
+// ✅ Saber si un wa_id ya tiene mensajes (rápido: pageSize 1)
+async function airtableHasMessages(waId) {
+  const formula = encodeURIComponent(`{${AIRTABLE_MSG_WA_ID_FIELD}}="${waId}"`);
+  const url = `${airtableMessagesUrl}?filterByFormula=${formula}&pageSize=1`;
+  const res = await axios.get(url, { headers: airtableHeaders() });
+  return (res.data.records || []).length > 0;
+}
+
 // ===================================
 // SSE (tiempo real)
 // ===================================
@@ -294,7 +303,6 @@ function portalAuth(req, res, next) {
 // ===================================
 async function syncAppointmentsToConversations(limit = 50) {
   const appointments = await airtableListUpcomingAppointments(limit);
-
   let created = 0;
 
   for (const appt of appointments) {
@@ -449,6 +457,7 @@ app.post("/portal/send", portalAuth, async (req, res) => {
 
     let finalConvo = convo;
 
+    // ✅ IMPORTANTE: si el portal envía un mensaje → la conversación es Activa
     if (!finalConvo) {
       finalConvo = await airtableCreateConversation({
         [AIRTABLE_WA_ID_FIELD]: wa_id,
@@ -456,13 +465,13 @@ app.post("/portal/send", portalAuth, async (req, res) => {
         [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
         [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: isoNow(),
         [AIRTABLE_WA_PHONE_NUMBER_ID_FIELD]: WHATSAPP_PHONE_NUMBER_ID,
-        [AIRTABLE_WA_STATUS_FIELD]: "Mensaje enviado",
+        [AIRTABLE_WA_STATUS_FIELD]: "Activa",
       });
     } else {
       await airtableUpdateConversation(finalConvo.id, {
         [AIRTABLE_WA_LAST_MESSAGE_FIELD]: text,
         [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: isoNow(),
-        [AIRTABLE_WA_STATUS_FIELD]: "Mensaje enviado",
+        [AIRTABLE_WA_STATUS_FIELD]: "Activa",
       });
     }
 
@@ -587,6 +596,9 @@ app.post("/webhooks/whatsapp", async (req, res) => {
         const phoneNumberId = value?.metadata?.phone_number_id || null;
         const contactName = contacts?.[0]?.profile?.name || "";
 
+        // ✅ FIX CRÍTICO: aquí sí existe phoneE164
+        const phoneE164 = toE164FromWaId(waId);
+
         // 1) Buscar conversación existente
         let convo = await airtableFindConversationByWaId(waId);
 
@@ -646,10 +658,14 @@ app.post("/webhooks/whatsapp", async (req, res) => {
         }
 
         // 2) Buscar cita por teléfono
-        const phoneE164 = toE164FromWaId(waId);
         const appointment = await airtableFindAppointmentByPhone(phoneE164);
 
-        const status = appointment ? "Programada" : "Mensaje enviado";
+        // ✅ si ya hay mensajes, NO puede ser Programada
+        const hasMsgs = await airtableHasMessages(waId);
+
+        // ✅ Estado correcto:
+        let status = "Activa";
+        if (appointment && !hasMsgs) status = "Programada";
 
         const convoFields = {
           [AIRTABLE_WA_ID_FIELD]: waId,
