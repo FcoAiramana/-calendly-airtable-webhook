@@ -353,7 +353,7 @@ app.get("/portal/messages", portalAuth, async (req, res) => {
     const waId = String(req.query.wa_id || "").trim();
     if (!waId) return res.status(400).json({ ok: false, error: "Missing wa_id" });
 
-    const records = await airtableListMessagesByWaId(waId, 200);
+    const records = await airtableListMessagesByWaId(waId, 100);
 
     const items = records.map((rec) => ({
       message_id: rec.fields?.[AIRTABLE_MSG_ID_FIELD] || rec.id,
