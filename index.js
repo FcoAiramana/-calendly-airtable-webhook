@@ -8,10 +8,9 @@ app.use(express.json({ limit: "1mb" }));
 // ===================================
 // ✅ CORS (necesario para Portal + SSE)
 // ===================================
-// ✅ CORS dinámico: permite localhost + vercel + otros que añadas
 const ALLOWED_ORIGINS = [
   "http://localhost:3000",
-  // añade aquí tu dominio final de Vercel cuando lo tengas
+  // añade tu dominio final de Vercel cuando lo tengas:
   // "https://ace-project.vercel.app",
 ];
 
@@ -33,7 +32,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Render necesita process.env.PORT
 const PORT = process.env.PORT || 3000;
 
 // ===================================
@@ -139,6 +137,21 @@ async function airtableFindAppointmentByPhone(phoneE164) {
   return res.data.records?.[0] || null;
 }
 
+// ✅ Listar próximas citas desde Airtable (Fecha >= ahora)
+async function airtableListUpcomingAppointments(limit = 50) {
+  const DATE_FIELD = "Fecha"; // ✅ confirmado
+
+  const now = new Date().toISOString();
+  const formula = encodeURIComponent(`{${DATE_FIELD}}>="${now}"`);
+
+  const url = `${airtableCitasUrl}?filterByFormula=${formula}&sort[0][field]=${encodeURIComponent(
+    DATE_FIELD
+  )}&sort[0][direction]=asc&pageSize=${Math.min(limit, 100)}`;
+
+  const res = await axios.get(url, { headers: airtableHeaders() });
+  return res.data.records || [];
+}
+
 // ---- Conversaciones: buscar por wa_id ----
 async function airtableFindConversationByWaId(waId) {
   const formula = encodeURIComponent(`{${AIRTABLE_WA_ID_FIELD}}="${waId}"`);
@@ -175,7 +188,7 @@ async function airtableCreateMessage(fields) {
   return res.data.records?.[0];
 }
 
-// ✅ Listar mensajes por wa_id (MAX pageSize 100)
+// ✅ Listar mensajes por wa_id (pageSize siempre 100)
 async function airtableListMessagesByWaId(waId, limit = 100) {
   const pageSize = 100;
   const formula = encodeURIComponent(`{${AIRTABLE_MSG_WA_ID_FIELD}}="${waId}"`);
@@ -277,13 +290,67 @@ function portalAuth(req, res, next) {
 }
 
 // ===================================
+// ✅ SYNC: crea conversaciones Programadas desde citas futuras
+// ===================================
+async function syncAppointmentsToConversations(limit = 50) {
+  const appointments = await airtableListUpcomingAppointments(limit);
+
+  let created = 0;
+
+  for (const appt of appointments) {
+    const phoneE164 = appt.fields?.["Teléfono E164"];
+    if (!phoneE164) continue;
+
+    const waId = String(phoneE164).replace("+", "").trim();
+    if (!waId) continue;
+
+    // Si ya existe conversación, no duplicamos
+    const existing = await airtableFindConversationByWaId(waId);
+    if (existing) continue;
+
+    await airtableCreateConversation({
+      [AIRTABLE_WA_ID_FIELD]: waId,
+      Nombre: appt.fields?.["Nombre"] || "",
+      [AIRTABLE_WA_STATUS_FIELD]: "Programada",
+      [AIRTABLE_WA_PHONE_NUMBER_ID_FIELD]: WHATSAPP_PHONE_NUMBER_ID,
+      [AIRTABLE_WA_LAST_MESSAGE_FIELD]: "📅 Cita programada (sin mensajes aún)",
+      [AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD]: isoNow(),
+      [AIRTABLE_WA_LINK_FIELD]: [appt.id],
+    });
+
+    created++;
+    console.log("[SYNC] ✅ Created scheduled convo:", waId);
+  }
+
+  return { created, total: appointments.length };
+}
+
+// Endpoint manual (por si quieres forzarlo)
+app.post("/sync/appointments", portalAuth, async (req, res) => {
+  try {
+    const result = await syncAppointmentsToConversations(50);
+    return res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error("[SYNC-APPOINTMENTS] Error:", e?.response?.data || e.message);
+    return res.status(500).json({ ok: false, error: e?.response?.data || e.message });
+  }
+});
+
+// Ejecuta sync cada 10 minutos automáticamente
+setInterval(async () => {
+  try {
+    await syncAppointmentsToConversations(50);
+  } catch (e) {
+    console.error("[SYNC] ❌ Error:", e?.response?.data || e.message);
+  }
+}, 10 * 60 * 1000);
+
+// ===================================
 // Portal → listar conversaciones (INBOX)
 // ===================================
 app.get("/portal/conversations", portalAuth, async (req, res) => {
   try {
-    const formula = encodeURIComponent(
-      `{${AIRTABLE_WA_STATUS_FIELD}}!="Cerrada"`
-    );
+    const formula = encodeURIComponent(`{${AIRTABLE_WA_STATUS_FIELD}}!="Cerrada"`);
 
     const url = `${airtableConversationsUrl}?filterByFormula=${formula}&sort[0][field]=${encodeURIComponent(
       AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD
@@ -398,9 +465,9 @@ app.post("/portal/send", portalAuth, async (req, res) => {
   }
 });
 
-// =============================
+// ===================================
 // Portal → cerrar conversación manualmente
-// =============================
+// ===================================
 app.post("/portal/close", portalAuth, async (req, res) => {
   try {
     const { wa_id } = req.body;
@@ -417,7 +484,6 @@ app.post("/portal/close", portalAuth, async (req, res) => {
       "⏳ Hemos cerrado esta conversación. Si deseas volver a hablar con nosotros, por favor reserva otra cita en Calendly o escríbenos por correo.";
 
     const data = await sendWhatsAppText(wa_id, finalText);
-
     const msgId = data?.messages?.[0]?.id || `out_close_${Date.now()}`;
 
     await airtableCreateMessage({
@@ -494,8 +560,6 @@ app.post("/webhooks/whatsapp", async (req, res) => {
         const phoneNumberId = value?.metadata?.phone_number_id || null;
         const contactName = contacts?.[0]?.profile?.name || "";
 
-        log("[WA] Incoming message:", { waId, contactName, text });
-
         // 1) Buscar conversación existente
         let convo = await airtableFindConversationByWaId(waId);
 
@@ -530,7 +594,7 @@ app.post("/webhooks/whatsapp", async (req, res) => {
             [AIRTABLE_MSG_CONVO_LINK_FIELD]: [convo.id],
           });
 
-          // SSE portal (para que lo veas en directo si estabas mirando)
+          // SSE portal
           sseSend(waId, {
             type: "message",
             direction: "IN",
@@ -605,74 +669,6 @@ app.post("/webhooks/whatsapp", async (req, res) => {
     console.error("[WA-WEBHOOK] ❌ Error:", e?.response?.data || e.message);
   }
 });
-
-// ===================================
-// Auto-close conversaciones (24h)
-// ===================================
-const AUTO_CLOSE_CHECK_MINUTES = 15;
-const AUTO_CLOSE_AFTER_HOURS = 24;
-
-async function autoCloseConversations() {
-  try {
-    const cutoff = new Date(
-      Date.now() - AUTO_CLOSE_AFTER_HOURS * 60 * 60 * 1000
-    ).toISOString();
-
-    const formula = encodeURIComponent(
-      `AND({${AIRTABLE_WA_STATUS_FIELD}}!="Cerrada",{${AIRTABLE_WA_LAST_MESSAGE_TIME_FIELD}}<"${cutoff}")`
-    );
-
-    const url = `${airtableConversationsUrl}?filterByFormula=${formula}&pageSize=50`;
-    const res = await axios.get(url, { headers: airtableHeaders() });
-
-    const records = res.data.records || [];
-    if (!records.length) return;
-
-    console.log(`[AUTO-CLOSE] Found ${records.length} conversations to close`);
-
-    for (const r of records) {
-      const waId = r.fields?.[AIRTABLE_WA_ID_FIELD];
-      if (!waId) continue;
-
-      const finalText =
-        "⏳ Hemos cerrado esta conversación. Si deseas volver a hablar con nosotros, por favor reserva otra cita en Calendly o escríbenos por correo.";
-
-      try {
-        await sendWhatsAppText(waId, finalText);
-
-        const msgId = `out_close_${Date.now()}`;
-
-        await airtableCreateMessage({
-          [AIRTABLE_MSG_ID_FIELD]: msgId,
-          [AIRTABLE_MSG_DIRECTION_FIELD]: "OUT",
-          [AIRTABLE_MSG_WA_ID_FIELD]: waId,
-          [AIRTABLE_MSG_TEXT_FIELD]: finalText,
-          [AIRTABLE_MSG_DATE_FIELD]: isoNow(),
-          [AIRTABLE_MSG_CONVO_LINK_FIELD]: [r.id],
-        });
-
-        await airtableUpdateConversation(r.id, {
-          [AIRTABLE_WA_STATUS_FIELD]: "Cerrada",
-        });
-
-        sseSend(waId, {
-          type: "conversation_closed",
-          wa_id: waId,
-          text: finalText,
-          date: isoNow(),
-        });
-
-        console.log("[AUTO-CLOSE] Closed:", waId);
-      } catch (e) {
-        console.error("[AUTO-CLOSE] Error closing:", waId, e?.response?.data || e.message);
-      }
-    }
-  } catch (e) {
-    console.error("[AUTO-CLOSE] Error:", e?.response?.data || e.message);
-  }
-}
-
-setInterval(autoCloseConversations, AUTO_CLOSE_CHECK_MINUTES * 60 * 1000);
 
 // ===================================
 // LISTEN
